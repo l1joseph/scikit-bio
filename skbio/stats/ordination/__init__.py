@@ -61,6 +61,15 @@ Multimodal embedding
    MMvecResults
 
 
+Matrix completion
+-----------------
+
+.. autosummary::
+   :toctree:
+
+   optspace
+
+
 Ordination results
 ------------------
 
@@ -178,6 +187,7 @@ from ._principal_coordinate_analysis import pcoa, pcoa_biplot
 from ._principal_component_analysis import pca
 from ._ordination_results import OrdinationResults
 from ._mmvec import mmvec, MMvecResults
+from ._optspace import optspace
 from ._utils import (
     mean_and_std,
     scale,
@@ -197,6 +207,7 @@ __all__ = [
     "pcoa_biplot",
     "mmvec",
     "MMvecResults",
+    "optspace",
     "OrdinationResults",
     "mean_and_std",
     "scale",
