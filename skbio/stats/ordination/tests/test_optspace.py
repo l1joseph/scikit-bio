@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import numpy as np
 
+from skbio import get_config, set_config
+from skbio.stats.ordination import _optspace as optspace_mod
 from skbio.stats.ordination._optspace import (
     optspace,
     _obs_basis,
@@ -22,6 +24,7 @@ from skbio.stats.ordination._optspace import (
     jacobian_UV,
     jacobian_UV_adj,
 )
+from skbio.util import numba_code
 
 
 class TestOptSpace(unittest.TestCase):
@@ -364,6 +367,175 @@ class TestJacobian(unittest.TestCase):
             lhs = Jx @ y
             rhs = np.sum(dU * JtY_U) + np.sum(dV * JtY_V)
             self.assertAlmostEqual(lhs, rhs, delta=1e-12 * max(1.0, abs(lhs)))
+
+
+class TestJacobianNumba(unittest.TestCase):
+    """The Numba Jacobian kernels reproduce their NumPy counterparts.
+
+    Reuses the fixture of :class:`TestJacobian` so both engines are checked
+    against the same factorization and observation pattern.
+    """
+
+    setUp = TestJacobian.setUp
+
+    @numba_code
+    def test_jacobian_UV_nb_matches_numpy(self):
+        """The fused gather kernel matches the NumPy row-sums."""
+        dU = self.rng.normal(size=(self.m, self.r))
+        dV = self.rng.normal(size=(self.n, self.r))
+
+        # Both engines consume the already-projected steps.
+        dU_t = dU - self.U @ (self.U.T @ dU)
+        dV_t = dV - self.V @ (self.V.T @ dV)
+
+        expected = (dU_t[self.rows] * self.VST[self.cols]).sum(axis=1)
+        expected += (self.US[self.rows] * dV_t[self.cols]).sum(axis=1)
+
+        observed = optspace_mod._jacobian_UV_nb(
+            dU_t, dV_t, self.rows, self.cols, self.US, self.VST
+        )
+        np.testing.assert_allclose(observed, expected, atol=1e-10)
+
+    @numba_code
+    def test_jacobian_UV_adj_nb_matches_numpy(self):
+        """The fused scatter kernel matches the NumPy bincount loop."""
+        w = self.rng.normal(size=self.n_observed)
+
+        expected_dU = np.empty((self.m, self.r))
+        expected_dV = np.empty((self.n, self.r))
+        for q in range(self.r):
+            expected_dU[:, q] = np.bincount(
+                self.rows, weights=w * self.VST[self.cols, q], minlength=self.m
+            )
+            expected_dV[:, q] = np.bincount(
+                self.cols, weights=w * self.US[self.rows, q], minlength=self.n
+            )
+
+        observed_dU, observed_dV = optspace_mod._jacobian_UV_adj_nb(
+            w, self.rows, self.cols, self.US, self.VST, self.m, self.n
+        )
+        np.testing.assert_allclose(observed_dU, expected_dU, atol=1e-10)
+        np.testing.assert_allclose(observed_dV, expected_dV, atol=1e-10)
+
+    @numba_code
+    def test_jacobian_UV_engine_agreement(self):
+        """The full operator agrees between engines, projections included."""
+        dU = self.rng.normal(size=(self.m, self.r))
+        dV = self.rng.normal(size=(self.n, self.r))
+
+        args = (self.rows, self.cols, self.US, self.VST, self.Q)
+        expected = jacobian_UV(self.U, self.V, dU, dV, *args, "numpy")
+        observed = jacobian_UV(self.U, self.V, dU, dV, *args, "numba")
+        np.testing.assert_allclose(observed, expected, atol=1e-10)
+
+    @numba_code
+    def test_jacobian_UV_adj_engine_agreement(self):
+        """The full adjoint agrees between engines, projections included."""
+        w = self.rng.normal(size=self.n_observed)
+
+        args = (self.rows, self.cols, self.US, self.VST, self.Q)
+        expected_dU, expected_dV = jacobian_UV_adj(self.U, self.V, w, *args, "numpy")
+        observed_dU, observed_dV = jacobian_UV_adj(self.U, self.V, w, *args, "numba")
+        np.testing.assert_allclose(observed_dU, expected_dU, atol=1e-10)
+        np.testing.assert_allclose(observed_dV, expected_dV, atol=1e-10)
+
+    @numba_code
+    def test_jacobian_UV_adjoint_identity_nb(self):
+        """The Numba pair is an exact adjoint pair, as LSMR requires."""
+        dU = self.rng.normal(size=(self.m, self.r))
+        dV = self.rng.normal(size=(self.n, self.r))
+        y = self.rng.normal(size=self.n_observed)
+
+        args = (self.rows, self.cols, self.US, self.VST, self.Q)
+        Jx = jacobian_UV(self.U, self.V, dU, dV, *args, "numba")
+        JtY_U, JtY_V = jacobian_UV_adj(self.U, self.V, y, *args, "numba")
+
+        lhs = Jx @ y
+        rhs = np.sum(dU * JtY_U) + np.sum(dV * JtY_V)
+        self.assertAlmostEqual(lhs, rhs, delta=1e-12 * max(1.0, abs(lhs)))
+
+
+class TestEngine(unittest.TestCase):
+    """The ``engine`` argument selects an implementation, not a result."""
+
+    def setUp(self):
+        """Reuse the small fixture the Jacobian tests complete against."""
+        rng = np.random.default_rng(0)
+        self.m, self.n, self.r = 60, 40, 3
+        M_true = rng.normal(size=(self.m, self.r)) @ rng.normal(
+            size=(self.n, self.r)
+        ).T
+        self.M_obs = M_true + 0.01 * rng.normal(size=M_true.shape)
+        self.M_obs[~(rng.random((self.m, self.n)) < 0.5)] = np.nan
+
+    def test_default_engine_matches_numpy(self):
+        """Not passing ``engine`` reproduces the NumPy path.
+
+        The global default is ``"cython"``, which this function has no
+        implementation for; it must fall back to NumPy rather than raise. The
+        comparison is not exact because the ARPACK initialization in
+        ``_svd_init`` starts from a random vector.
+        """
+        for method in ("GD", "GN"):
+            with self.subTest(method=method):
+                default = optspace(self.M_obs, self.r, method=method)
+                explicit = optspace(
+                    self.M_obs, self.r, method=method, engine="numpy"
+                )
+                np.testing.assert_allclose(default, explicit, atol=1e-10)
+
+    @numba_code
+    def test_default_engine_does_not_use_numba(self):
+        """Callers who do not opt in never reach the Numba kernels."""
+        for method in ("GD", "GN"):
+            with self.subTest(method=method):
+                with patch.object(
+                    optspace_mod, "_jacobian_UV_nb"
+                ) as forward, patch.object(
+                    optspace_mod, "_jacobian_UV_adj_nb"
+                ) as adjoint:
+                    optspace(self.M_obs, self.r, method=method)
+                forward.assert_not_called()
+                adjoint.assert_not_called()
+
+    @numba_code
+    def test_engine_numba_matches_numpy(self):
+        """Both engines complete the same matrix."""
+        for method in ("GD", "GN"):
+            with self.subTest(method=method):
+                expected = optspace(
+                    self.M_obs, self.r, method=method, engine="numpy"
+                )
+                observed = optspace(
+                    self.M_obs, self.r, method=method, engine="numba"
+                )
+                np.testing.assert_allclose(observed, expected, atol=1e-6)
+
+    @numba_code
+    def test_global_engine_numba_is_honored(self):
+        """Setting the global engine to Numba selects the kernels."""
+        original = get_config("engine")
+        try:
+            set_config("engine", "numba")
+            with patch.object(
+                optspace_mod,
+                "_jacobian_UV_adj_nb",
+                wraps=optspace_mod._jacobian_UV_adj_nb,
+            ) as adjoint:
+                optspace(self.M_obs, self.r, method="GD")
+            self.assertTrue(adjoint.called)
+        finally:
+            set_config("engine", original)
+
+    def test_bad_engine_raises(self):
+        """An unsupported engine name is rejected."""
+        with self.assertRaisesRegex(ValueError, "engine='julia' is not supported"):
+            optspace(self.M_obs, self.r, engine="julia")
+
+    def test_cython_engine_raises(self):
+        """There is no Cython implementation, so requesting it is an error."""
+        with self.assertRaisesRegex(ValueError, "engine='cython' is not supported"):
+            optspace(self.M_obs, self.r, engine="cython")
 
 
 class TestRankDeficient(unittest.TestCase):
