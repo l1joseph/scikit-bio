@@ -161,18 +161,18 @@ def _geomedian_axis_one(X, engine):
     numpy.ndarray
         The length-``p`` geometric median.
     """
+    # geomedian_axis_one is a Cython fused-type function: given float32 input it
+    # computes natively in float32, while the numba kernel below always computes
+    # in float64. Promoting here keeps both engines numerically consistent; the
+    # asarray is a no-op (no copy) for input that's already float64.
+    Xc = np.asarray(X, dtype=np.float64)
     if engine == "numba":
         if not NUMBA_AVAILABLE:
             raise ImportError("engine='numba' requires the optional numba dependency.")
-        # X is typically a transposed view (group_data.T); asarray (unlike
-        # ascontiguousarray) only casts dtype and leaves an already-float64 array
-        # as-is, so this avoids forcing a full transpose-copy on every call. Numba
-        # handles the resulting non-contiguous 2-D array directly.
-        Xc = np.asarray(X, dtype=np.float64)
         return np.asarray(
             _geomedian_axis_one_nb(Xc, _GEOMEDIAN_EPS, _GEOMEDIAN_MAXITERS)
         )
-    return np.asarray(geomedian_axis_one(X))
+    return np.asarray(geomedian_axis_one(Xc))
 
 
 @params_aliased(

@@ -362,6 +362,23 @@ class PERMDISPTests(TestCase):
             with self.assertRaisesRegex(ImportError, "requires the optional numba"):
                 _geomedian_axis_one(self.eq_mat.data, "numba")
 
+    def test_geomedian_cython_float32_matches_float64(self):
+        # _geomedian_axis_one promotes to float64 before calling either
+        # engine, so a float32 input should give the same cython result as
+        # the same data already in float64.
+        X64 = self.eq_mat.data
+        X32 = X64.astype(np.float32)
+        cy64 = _geomedian_axis_one(X64, "cython")
+        cy32 = _geomedian_axis_one(X32, "cython")
+        npt.assert_allclose(cy32, cy64, rtol=0, atol=1e-10)
+
+    @numba_code
+    def test_geomedian_numba_float32_matches_cython(self):
+        X32 = self.eq_mat.data.astype(np.float32)
+        cy = _geomedian_axis_one(X32, "cython")
+        nb = _geomedian_axis_one(X32, "numba")
+        npt.assert_allclose(nb, cy, rtol=0, atol=1e-10)
+
     @numba_code
     def test_permdisp_engine_equivalence(self):
         exp = permdisp(self.eq_mat, self.grouping_eq, test='median',
