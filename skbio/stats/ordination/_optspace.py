@@ -38,6 +38,128 @@ import numpy as np
 from scipy.linalg import svd, qr, solve_triangular
 from scipy.sparse.linalg import svds, lsmr, LinearOperator
 
+from skbio._config import get_config, _resolve_engine
+
+try:
+    from numba import njit, prange
+
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(parallel=True)
+    def _jacobian_UV_nb(dU_t, dV_t, rows, cols, US, VST):
+        """Compute the entry-indexed J_UV product using Numba.
+
+        Fuses the two gathers and row-sums of :func:`jacobian_UV`,
+
+            w[k] = dU_t[i] . VST[j] + US[i] . dV_t[j],   k = (i, j)
+
+        into a single pass over the observed entries, so the ``(n_observed, r)``
+        temporaries that the NumPy expression materializes are never allocated.
+
+        Each output entry ``w[k]`` depends only on its own ``(i, j)`` pair, so
+        the loop is a pure gather-reduction and parallelizes without conflicts.
+
+        Parameters
+        ----------
+        dU_t : np.ndarray, shape (m, r)
+            Left step, already projected onto the tangent space of ``U``.
+        dV_t : np.ndarray, shape (n, r)
+            Right step, already projected onto the tangent space of ``V``.
+        rows : np.ndarray, shape (n_observed,)
+            Row index of each observed entry.
+        cols : np.ndarray, shape (n_observed,)
+            Column index of each observed entry.
+        US : np.ndarray, shape (m, r)
+            Precomputed ``U @ S``.
+        VST : np.ndarray, shape (n, r)
+            Precomputed ``V @ S.T``.
+
+        Returns
+        -------
+        np.ndarray, shape (n_observed,)
+            The Jacobian evaluated at the observed entries, before projection
+            onto the complement of the S tangent space.
+
+        """
+        n_observed = rows.shape[0]
+        r = US.shape[1]
+        w = np.empty(n_observed, np.float64)
+
+        for k in prange(n_observed):
+            i = rows[k]
+            j = cols[k]
+            total = 0.0
+            for q in range(r):
+                total += dU_t[i, q] * VST[j, q] + US[i, q] * dV_t[j, q]
+            w[k] = total
+
+        return w
+
+    @njit
+    def _jacobian_UV_adj_nb(w, rows, cols, US, VST, m, n):
+        """Compute the entry-indexed J_UV adjoint using Numba.
+
+        Replaces the ``r`` passes of :func:`numpy.bincount` in
+        :func:`jacobian_UV_adj` with a single pass over the observed entries
+        that scatters into both factors at once,
+
+            dU[i] += w[k] * VST[j],   dV[j] += w[k] * US[i],   k = (i, j)
+
+        avoiding the ``2 * r`` weight vectors of length ``n_observed`` that the
+        NumPy form builds.
+
+        This kernel is deliberately serial. Observed entries sharing a row (or a
+        column) accumulate into the same ``dU`` (or ``dV``) slot, so a ``prange``
+        over ``k`` would race. Parallelizing the scatter would require grouping
+        the entries by row and by column (a CSR/CSC-style traversal, or private
+        per-thread buffers that are then reduced), which is out of scope here.
+
+        Parameters
+        ----------
+        w : np.ndarray, shape (n_observed,)
+            Values at the observed entries, already projected onto the
+            complement of the S tangent space.
+        rows : np.ndarray, shape (n_observed,)
+            Row index of each observed entry.
+        cols : np.ndarray, shape (n_observed,)
+            Column index of each observed entry.
+        US : np.ndarray, shape (m, r)
+            Precomputed ``U @ S``.
+        VST : np.ndarray, shape (n, r)
+            Precomputed ``V @ S.T``.
+        m : int
+            Number of rows of ``U``.
+        n : int
+            Number of rows of ``V``.
+
+        Returns
+        -------
+        dU : np.ndarray, shape (m, r)
+            Left component of the adjoint, before tangent space projection.
+        dV : np.ndarray, shape (n, r)
+            Right component of the adjoint, before tangent space projection.
+
+        """
+        n_observed = rows.shape[0]
+        r = US.shape[1]
+        dU = np.zeros((m, r), np.float64)
+        dV = np.zeros((n, r), np.float64)
+
+        for k in range(n_observed):
+            i = rows[k]
+            j = cols[k]
+            w_k = w[k]
+            for q in range(r):
+                dU[i, q] += w_k * VST[j, q]
+                dV[j, q] += w_k * US[i, q]
+
+        return dU, dV
+
 
 def _check_unobserved(observed_mask):
 
@@ -259,7 +381,7 @@ def _solve_S(Q, R, perm, b, r):
     return s.reshape(r, r)
 
 
-def jacobian_UV(U, V, dU, dV, rows, cols, US, VST, Q):
+def jacobian_UV(U, V, dU, dV, rows, cols, US, VST, Q, engine="numpy"):
     """Compute J_UV(dU, dV).
 
     The Jacobian is
@@ -282,6 +404,11 @@ def jacobian_UV(U, V, dU, dV, rows, cols, US, VST, Q):
     This is pre-composed with projection of the pair (dU, dV) onto the tangent
     space of (U, V), and post-composed with projection onto the orthogonal
     complement of the S tangent space.
+
+    ``engine`` selects the implementation of the entry-indexed gather, which is
+    the dominant cost of this function. It must already be resolved (see
+    :func:`optspace`); ``"numpy"`` is the default so that direct callers of this
+    operator keep the reference behavior.
     """
 
     # Project input onto (U, V) tangent space
@@ -289,14 +416,17 @@ def jacobian_UV(U, V, dU, dV, rows, cols, US, VST, Q):
     dV_t = dV - V @ (V.T @ dV)
 
     # Compute Jacobian over the observed entries only
-    w = (dU_t[rows] * VST[cols]).sum(axis=1)
-    w += (US[rows] * dV_t[cols]).sum(axis=1)
+    if engine == "numba":
+        w = _jacobian_UV_nb(dU_t, dV_t, rows, cols, US, VST)
+    else:
+        w = (dU_t[rows] * VST[cols]).sum(axis=1)
+        w += (US[rows] * dV_t[cols]).sum(axis=1)
 
     # Project output onto complement of S tangent space
     return _project_S_complement(Q, w)
 
 
-def jacobian_UV_adj(U, V, w, rows, cols, US, VST, Q):
+def jacobian_UV_adj(U, V, w, rows, cols, US, VST, Q, engine="numpy"):
     """Compute J*(W).
 
     The Jacobian adjoint is defined with respect to the inner product by
@@ -315,6 +445,11 @@ def jacobian_UV_adj(U, V, w, rows, cols, US, VST, Q):
     space and the output is projected back to the tangent space of (U, V). Both
     projections are self-adjoint, so this is the exact adjoint of
     :func:`jacobian_UV`.
+
+    ``engine`` selects the implementation of the entry-indexed scatter, which is
+    the dominant cost of this function. It must already be resolved (see
+    :func:`optspace`); ``"numpy"`` is the default so that direct callers of this
+    operator keep the reference behavior.
     """
 
     m, r = U.shape
@@ -324,11 +459,14 @@ def jacobian_UV_adj(U, V, w, rows, cols, US, VST, Q):
     w = _project_S_complement(Q, w)
 
     # Compute Jacobian adjoint by scattering into the factor rows
-    dU = np.empty((m, r), dtype=U.dtype)
-    dV = np.empty((n, r), dtype=V.dtype)
-    for q in range(r):
-        dU[:, q] = np.bincount(rows, weights=w * VST[cols, q], minlength=m)
-        dV[:, q] = np.bincount(cols, weights=w * US[rows, q], minlength=n)
+    if engine == "numba":
+        dU, dV = _jacobian_UV_adj_nb(w, rows, cols, US, VST, m, n)
+    else:
+        dU = np.empty((m, r), dtype=U.dtype)
+        dV = np.empty((n, r), dtype=V.dtype)
+        for q in range(r):
+            dU[:, q] = np.bincount(rows, weights=w * VST[cols, q], minlength=m)
+            dV[:, q] = np.bincount(cols, weights=w * US[rows, q], minlength=n)
 
     # Project output onto (U, V) tangent space
     dU -= U @ (U.T @ dU)
@@ -352,7 +490,9 @@ def unpack(x, U_shape, V_shape):
     return dU, dV
 
 
-def solve_gauss_newton_step(U, V, rows, cols, US, VST, Q_S, residual, tol, damp):
+def solve_gauss_newton_step(
+    U, V, rows, cols, US, VST, Q_S, residual, tol, damp, engine="numpy"
+):
     """Solve (J_UV* J_UV)dx = -J_UV* residual.
 
     The Gauss-Newton step is the vector dx = (dU, dV), where dU and dV are
@@ -364,16 +504,19 @@ def solve_gauss_newton_step(U, V, rows, cols, US, VST, Q_S, residual, tol, damp)
     are fixed for the duration of this call, so they are computed once by the
     caller and closed over by the matrix-vector products rather than being
     rebuilt on every LSMR iteration.
+
+    ``engine`` is forwarded to the Jacobian products, which LSMR calls once each
+    per iteration and which dominate the cost of the step.
     """
 
     nvars = U.size + V.size
 
     def matvec(x):
         dU, dV = unpack(x, U.shape, V.shape)
-        return jacobian_UV(U, V, dU, dV, rows, cols, US, VST, Q_S)
+        return jacobian_UV(U, V, dU, dV, rows, cols, US, VST, Q_S, engine)
 
     def rmatvec(y):
-        dU, dV = jacobian_UV_adj(U, V, y, rows, cols, US, VST, Q_S)
+        dU, dV = jacobian_UV_adj(U, V, y, rows, cols, US, VST, Q_S, engine)
         return pack(dU, dV)
 
     J_UV = LinearOperator(
@@ -440,7 +583,7 @@ def retract_grassmann(X, dX):
     return np.linalg.qr(X + dX, mode="reduced")[0]
 
 
-def optspace(X, dimensions=3, max_iter=10000, tol=1e-5, method="GD"):
+def optspace(X, dimensions=3, max_iter=10000, tol=1e-5, method="GD", engine=None):
     r"""Matrix completion using the OptSpace algorithm.
 
     OptSpace is an algorithm for recovering a low-rank matrix from a subset of observed
@@ -464,6 +607,16 @@ def optspace(X, dimensions=3, max_iter=10000, tol=1e-5, method="GD"):
     method : {'GD', 'GN'}, optional
         The optimization method to use. Options are gradient descent ("GD", default)
         and Gauss-Newton ("GN").
+    engine : {"numpy", "numba"}, optional
+        Compute engine to use for the entry-indexed Jacobian products.
+        ``"numpy"`` (default) uses the vectorized NumPy implementation.
+        ``"numba"`` uses the optional Numba implementation and requires Numba to
+        be installed. If not provided, the global default is used (see
+        :func:`skbio.set_config`); note that this function has no Cython
+        implementation, so the global default of ``"cython"`` selects
+        ``"numpy"`` here.
+
+        .. versionadded:: 0.7.4
 
     Returns
     -------
@@ -550,6 +703,14 @@ def optspace(X, dimensions=3, max_iter=10000, tol=1e-5, method="GD"):
 
     elif not np.issubdtype(type(max_iter), np.integer) or max_iter < 1:
         raise ValueError("Max_iter must be a positive integer")
+
+    # Resolve the compute engine for the Jacobian products. This function has no
+    # Cython implementation, so NumPy -- not Cython -- is its baseline engine.
+    # The global default of "cython" therefore means "the user has not opted into
+    # Numba" and is mapped to "numpy" rather than rejected.
+    if engine is None and get_config("engine") == "cython":
+        engine = "numpy"
+    engine = _resolve_engine(engine, ("numpy", "numba"))
 
     # Create observed mask
     observed_mask = ~np.isnan(X)
@@ -647,7 +808,7 @@ def optspace(X, dimensions=3, max_iter=10000, tol=1e-5, method="GD"):
         # Update via gradient descent with line search
         if method == "GD":
             # Compute gradient directions
-            dU, dV = jacobian_UV_adj(U, V, -R, rows, cols, US, VST, Q_S)
+            dU, dV = jacobian_UV_adj(U, V, -R, rows, cols, US, VST, Q_S, engine)
 
             # Perform backtracking line search
             U, V, obj, alpha = line_search(
@@ -658,7 +819,7 @@ def optspace(X, dimensions=3, max_iter=10000, tol=1e-5, method="GD"):
         if method == "GN":
             # Compute Gauss-Newton step
             dU, dV = solve_gauss_newton_step(
-                U, V, rows, cols, US, VST, Q_S, R, tol, damp
+                U, V, rows, cols, US, VST, Q_S, R, tol, damp, engine
             )
 
             # Retract updates back to Grassmann manifold
