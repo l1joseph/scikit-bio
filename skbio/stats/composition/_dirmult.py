@@ -470,8 +470,9 @@ def dirmult_lme(
     class from statsmodels.
 
     .. note::
-        Because the analysis iteratively runs many numeric optimizations, it can take
-        longer than usual to finish. Please allow extra time for completion.
+        The default model is fitted in closed form for all features at once. See
+        Notes. Any other configuration falls back to running one numeric
+        optimization per feature per draw, which can take much longer to finish.
 
     Parameters
     ----------

@@ -468,7 +468,7 @@ class DirMultLMETests(TestCase):
     def test_dirmult_lme_randint_matches_mixedlm(self):
         # The batched random-intercept fit must reproduce MixedLM wherever
         # MixedLM's own optimizer actually reaches the optimum.
-        from statsmodels.regression.mixed_linear_model import MixedLM
+        from statsmodels.regression.mixed_linear_model import MixedLM, MixedLMParams
 
         rng = np.random.default_rng(0)
         for sizes in ([4] * 12, [2] * 25, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]):
@@ -485,8 +485,30 @@ class DirMultLMETests(TestCase):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     exp = MixedLM(resp[:, j], exog, groups).fit()
-                # Only compare where MixedLM found the same likelihood; where
-                # it stopped early, the batched fit is the better optimum.
+
+                # Independent of whether MixedLM's own optimizer reached this
+                # theta, confirm beta/bse match what MixedLM's own formulas
+                # give when fed the same theta directly. This catches a wrong
+                # beta/bse even where our likelihood legitimately beats
+                # MixedLM's, which the likelihood comparison alone cannot.
+                cov_re, vcomp = np.array([[theta[j]]]), np.zeros(0)
+                fe_ref, _ = exp.model.get_fe_params(cov_re, vcomp)
+                ref_params = MixedLMParams(
+                    exp.model.k_fe, exp.model.k_re, exp.model.k_vc
+                )
+                ref_params.fe_params, ref_params.cov_re, ref_params.vcomp = (
+                    fe_ref,
+                    cov_re,
+                    vcomp,
+                )
+                hess, _ = exp.model.hessian(ref_params)
+                bse_ref = np.sqrt(np.diag(np.linalg.inv(-hess))[: exp.model.k_fe])
+                npt.assert_allclose(beta[:, j], fe_ref, rtol=1e-6)
+                npt.assert_allclose(bse[:, j], bse_ref, rtol=1e-6)
+
+                # Only compare against MixedLM's own fit where it found the
+                # same likelihood; where it stopped early, the batched fit is
+                # the better optimum.
                 if llf[j] - exp.llf > 1e-6:
                     self.assertGreater(llf[j], exp.llf)
                     continue

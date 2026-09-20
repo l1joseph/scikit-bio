@@ -275,6 +275,7 @@ def _randint_fit_block(des, resp):
     # an arbitrary starting point, which is how the iterative optimizers in
     # `MixedLM.fit` fail on these data.
     best = _randint_scan(des, stats, resp.shape[1])
+    at_edge = best == _N_GRID - 1
     lo = _LOG_LO + (best - 1) * _STEP
     hi = _LOG_LO + (best + 1) * _STEP
 
@@ -298,10 +299,10 @@ def _randint_fit_block(des, resp):
         )
         left, right = new_left, new_right
 
-    return _randint_stats(des, np.exp(0.5 * (lo + hi)), stats)
+    return _randint_stats(des, np.exp(0.5 * (lo + hi)), stats, at_edge)
 
 
-def _randint_stats(des, theta, stats):
+def _randint_stats(des, theta, stats, at_edge):
     """Fixed effects and their standard errors at the fitted ``theta``."""
     llf, dinv, xvx, beta, qform = _randint_profile(des, theta, stats)
     dof, sums, sizes = des.dof, des.sums, des.sizes
@@ -343,9 +344,18 @@ def _randint_stats(des, theta, stats):
     # `MixedLM` returns NaN standard errors in the same situation. A zero
     # standard error would turn into an infinite test statistic, so screen it
     # out here rather than report a p-value of exactly zero.
+    #
+    # A feature whose scan optimum sits at the grid's upper edge is screened
+    # out too. Theta = 0 at the lower edge is a legitimate, common fit (no
+    # detectable group variance), but there is no such bound on the high side:
+    # if the profile likelihood is still increasing at the upper edge, the
+    # true REML optimum is unbounded, and the golden-section bracket, which
+    # only extends one grid step past that edge, would settle inside that
+    # narrow window instead of at the true supremum.
     ok = (
         np.isfinite(beta).all(axis=0)
         & np.isfinite(bse).all(axis=0)
         & (bse > 0).all(axis=0)
+        & ~at_edge
     )
     return beta, bse, ok, theta, llf
