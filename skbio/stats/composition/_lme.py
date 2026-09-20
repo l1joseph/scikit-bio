@@ -24,7 +24,15 @@ available in closed form. Profiling out :math:`\beta` and :math:`\sigma^2`
 leaves a one-dimensional maximization over :math:`\theta`, in which every term
 is a contraction of per-group sums of the design with per-group sums of the
 response. The design half is therefore computed once and reused for every
-response vector, and the maximization runs for all of them at once.
+response vector, and the maximization runs for all of them at once. This is
+the profile likelihood construction of Lindstrom & Bates (1988), specialized
+to a single random intercept.
+
+References
+----------
+.. [1] Lindstrom, M. J., & Bates, D. M. (1988). Newton-Raphson and EM
+   algorithms for linear mixed-effects models for repeated-measures data.
+   Journal of the American Statistical Association, 83(404), 1014-1022.
 
 """
 
