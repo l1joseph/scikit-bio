@@ -156,13 +156,16 @@ def mmvec(
     output_format : str, optional
         Output table format. See :ref:`table_params` for details.
     engine : {"cython", "numba"}, optional
-        Compute engine for the Adam optimizer's gradient scatter-add step.
-        Ignored for ``optimizer="lbfgs"``. ``"cython"`` (default) uses
-        :func:`numpy.add.at` (mmvec has no compiled Cython implementation;
-        the name follows the library-wide convention where ``"cython"``
-        labels the non-JIT default engine). ``"numba"`` uses the optional
-        Numba implementation and requires Numba to be installed; it is not
-        used unless explicitly requested here.
+        Compute engine for the Adam optimizer's per-mini-batch loss and
+        gradient evaluation. Ignored for ``optimizer="lbfgs"``. ``"cython"``
+        (default) is a plain NumPy implementation (mmvec has no compiled
+        Cython implementation; the name follows the library-wide convention
+        where ``"cython"`` labels the non-JIT default engine). ``"numba"``
+        fuses the same computation into JIT-compiled kernels and requires
+        Numba to be installed; it is not used unless explicitly requested
+        here. The two agree to within double-precision rounding but are not
+        bit-for-bit identical, since the fused kernels cannot reproduce
+        NumPy's pairwise summation and BLAS reduction orders.
 
         .. versionadded:: 0.7.4
 
@@ -683,6 +686,13 @@ class MMvec(SkbioObject):
             engine=engine,
         )
 
+        # Both trainers gather rows of Y -- per mini-batch under Adam, and over
+        # all nonzero X entries at once under L-BFGS. _ingest_table returns an
+        # F-contiguous array for a DataFrame input, which makes every gathered
+        # row a walk over n_features_y separate cache lines, so copy it to C
+        # order once here rather than paying for it inside the loop.
+        y_arr = np.ascontiguousarray(y_arr)
+
         # Convert X to sparse COO format
         X_coo = coo_array(X_arr)
 
@@ -958,8 +968,180 @@ if NUMBA_AVAILABLE:
             for j in range(n_cols):
                 out[row, j] += scale * contrib[b, j]
 
+    @njit(fastmath=True)
+    def _minibatch_logits_nb(
+        sample_ids,
+        X_ids,
+        Y,
+        x_main,
+        x_bias,
+        y_main,
+        y_bias,
+        shifted,
+        row_max,
+        totals,
+        logits,
+    ):
+        """Fused first half of a mini-batch loss/gradient evaluation.
+
+        Computes the non-reference logits row by row, their row maxima (floored
+        at zero, matching the reference path's ``np.maximum(row_max, 0.0)``),
+        writes ``shifted[b, j] = logits[b, j] - row_max[b]`` for the caller's
+        vectorized ``np.exp`` and ``totals[b]`` for the second kernel, and
+        returns ``sum(Y_batch[:, 1:] * logits_nr)``.
+
+        The (n_batch, d2 - 1) logits array is never materialized: ``logits`` is
+        a single reused row-sized scratch buffer, so the whole row stays in L1
+        across the four sweeps over it.
+
+        ``np.exp`` deliberately stays with the caller. NumPy dispatches it to a
+        SIMD loop (~0.8 ns/element), whereas Numba emits a scalar libm call
+        (~4.2 ns/element) unless Intel SVML happens to be installed; at ~100k
+        exponentials per call that difference is larger than everything fusion
+        saves, so the kernel is split around it rather than fully fused.
+        """
+        n_batch = X_ids.shape[0]
+        p = y_main.shape[0]
+        m = y_main.shape[1]
+        loglik = 0.0
+        for b in range(n_batch):
+            xid = X_ids[b]
+            sid = sample_ids[b]
+            xb = x_bias[xid, 0]
+            for j in range(m):
+                logits[j] = y_bias[0, j] + xb
+            for k in range(p):
+                c = x_main[xid, k]
+                for j in range(m):
+                    logits[j] += c * y_main[k, j]
+            rmax = 0.0
+            for j in range(m):
+                if logits[j] > rmax:
+                    rmax = logits[j]
+            row_max[b] = rmax
+            # One pass over the sampled Y row serves all three of its uses:
+            # the shifted logits, the Y.logits term, and the row total. The
+            # reference path walks the row three separate times.
+            acc = 0.0
+            tot = Y[sid, 0]
+            for j in range(m):
+                yv = Y[sid, j + 1]
+                shifted[b, j] = logits[j] - rmax
+                acc += yv * logits[j]
+                tot += yv
+            totals[b] = tot
+            loglik += acc
+        return loglik
+
+    @njit(fastmath=True)
+    def _minibatch_grads_nb(
+        sample_ids,
+        X_ids,
+        Y,
+        exps,
+        row_max,
+        totals,
+        x_main,
+        y_main,
+        dx_main,
+        dx_bias,
+        dy_main,
+        dy_bias,
+        delta,
+    ):
+        """Fused second half of a mini-batch loss/gradient evaluation.
+
+        ``exps`` holds ``exp(logits - row_max)`` and ``totals`` the sampled Y
+        row sums, both produced by :func:`_minibatch_logits_nb`. For each row this
+        forms the log-normalizer, the grouped residuals, and all four gradient
+        accumulations in one pass, including the row-indexed X-side
+        accumulation that the ``"cython"`` path performs as two separate
+        :func:`_scatter_add_grad` calls.
+
+        Only the *unscaled* gradient sums are accumulated; the caller applies
+        ``-norm`` and the Gaussian prior terms, which touch the full parameter
+        matrices and are cheap by comparison. Returns
+        ``sum(totals * log_norm)``.
+        """
+        n_batch = X_ids.shape[0]
+        p = y_main.shape[0]
+        m = y_main.shape[1]
+        norm_term = 0.0
+        for b in range(n_batch):
+            sid = sample_ids[b]
+            xid = X_ids[b]
+            s = 0.0
+            for j in range(m):
+                s += exps[b, j]
+            rmax = row_max[b]
+            log_norm = rmax + np.log(np.exp(-rmax) + s)
+            # Written as exp(log_norm - row_max) to mirror the "cython" path
+            # rather than folded to (exp(-rmax) + s), which differs in the last
+            # ulp. Note fastmath permits the compiler to fold it anyway; this
+            # is a statement of intent, not a guarantee.
+            denom = np.exp(log_norm - rmax)
+            tot = totals[b]
+            norm_term += tot * log_norm
+
+            dxb = 0.0
+            for j in range(m):
+                d = Y[sid, j + 1] - tot * (exps[b, j] / denom)
+                delta[j] = d
+                dy_bias[0, j] += d
+                dxb += d
+            dx_bias[xid, 0] += dxb
+            for k in range(p):
+                c = x_main[xid, k]
+                a = 0.0
+                for j in range(m):
+                    d = delta[j]
+                    dy_main[k, j] += c * d
+                    a += d * y_main[k, j]
+                dx_main[xid, k] += a
+        return norm_term
+
 else:  # pragma: no cover
     _scatter_add_grad_nb = None
+    _minibatch_logits_nb = None
+    _minibatch_grads_nb = None
+
+
+def _nb_workspace(size: int, m: int) -> tuple[np.ndarray, ...]:
+    """Allocate reusable scratch for the Numba mini-batch kernels.
+
+    Built once per training run by :func:`_train_adam` and threaded through
+    :meth:`_MMvecModel.loss_and_grad`, mirroring how :func:`_train_lbfgs`
+    allocates workspaces for :meth:`_MMvecModel.loss_and_grad_fb`.
+
+    Parameters
+    ----------
+    size : int
+        Mini-batch size.
+    m : int
+        Number of non-reference Y features (``n_features_y - 1``).
+
+    Returns
+    -------
+    shifted : ndarray of shape (size, m)
+        Shifted logits, overwritten in place with their exponentials.
+    row_max : ndarray of shape (size,)
+        Row-wise maximum logit, floored at zero.
+    totals : ndarray of shape (size,)
+        Row-wise sum of the sampled Y counts.
+    logits : ndarray of shape (m,)
+        Single-row logit scratch, so the full (size, m) logit array is never
+        materialized.
+    delta : ndarray of shape (m,)
+        Single-row grouped-residual scratch.
+
+    """
+    return (
+        np.empty((size, m)),
+        np.empty(size),
+        np.empty(size),
+        np.empty(m),
+        np.empty(m),
+    )
 
 
 def _scatter_add_grad(
@@ -969,7 +1151,8 @@ def _scatter_add_grad(
 
     Both engines implement ``out += scale * contrib`` scattered by ``ids`` with
     ``np.add.at`` accumulation semantics and produce numerically identical
-    (bit-for-bit) results: contributions are summed in increasing batch order
+    (bit-for-bit) results for in-range ``ids`` (see below for out-of-range
+    behavior, which differs): contributions are summed in increasing batch order
     (the same order ``np.add.at`` uses), which matters because float addition
     is not associative.
 
@@ -1045,8 +1228,9 @@ class _MMvecModel:
         rng : numpy.random.Generator
             Random number generator.
         engine : {"cython", "numba"}, optional
-            Compute engine for the Adam optimizer's scatter-add gradient
-            step. Already resolved by the caller (:meth:`MMvec.fit`).
+            Compute engine for the Adam optimizer's per-mini-batch loss and
+            gradient evaluation. Already resolved by the caller
+            (:meth:`MMvec.fit`).
 
         """
         self.n_features_x = n_features_x
@@ -1074,8 +1258,9 @@ class _MMvecModel:
         Y: np.ndarray,
         size: int,
         norm: float,
-        weights: np.ndarray,
+        cdf: np.ndarray,
         rng: np.random.Generator,
+        nb_work: tuple[np.ndarray, ...] | None = None,
     ) -> tuple[float, Grad4Tuple]:
         """Compute loss and gradients for a mini-batch.
 
@@ -1084,15 +1269,21 @@ class _MMvecModel:
         X_coo : coo_array of shape (n_samples, n_features_x)
             Conditioning (X) feature counts in COO format.
         Y : np.ndarray of shape (n_samples, n_features_y)
-            Conditioned (Y) feature counts.
+            Conditioned (Y) feature counts. Must be C-contiguous; every
+            mini-batch gathers rows of it.
         size : int
             Mini-batch size.
         norm : float
             Batch normalization factor.
-        weights : np.ndarray of shape (n_samples,)
-            Sample weights for weighted batch sampling.
+        cdf : np.ndarray of shape (nnz,)
+            Cumulative distribution of the sampling weights, normalized to end
+            at 1.0. See :func:`_train_adam`, which builds it once.
         rng : numpy.random.Generator
             Random number generator for batch sampling.
+        nb_work : tuple of np.ndarray, optional
+            Reusable scratch buffers from :func:`_nb_workspace`, used only by
+            the ``"numba"`` engine. :func:`_train_adam` builds them once per
+            run; if omitted they are allocated per call.
 
         Returns
         -------
@@ -1101,15 +1292,20 @@ class _MMvecModel:
         grads : tuple of np.ndarray
             Gradients in the order of (dx_main, dx_bias, dy_main, dy_bias).
         """
-        batch_idx = rng.choice(len(X_coo.data), size=size, replace=True, p=weights)
+        # This is exactly what rng.choice(nnz, size, replace=True, p=weights)
+        # does internally, given an already-built cdf. The sampled indices and
+        # the resulting bit-generator state are unchanged, so a seeded run
+        # reproduces rng.choice's results bit for bit.
+        batch_idx = cdf.searchsorted(rng.random(size), side="right")
 
         sample_ids = X_coo.row[batch_idx]
-        # Cast once here rather than in _scatter_add_grad: X_ids is reused for
-        # both the dx_main and dx_bias scatter-adds below, and X_coo.col is
-        # int32 by default, so casting it up front means the second call's
-        # ascontiguousarray only re-checks dtype/contiguity instead of
-        # repeating the actual int32->intp copy.
+        # X_coo.col is int32 by default. Cast once here: both engines want
+        # intp, and on the "cython" path it spares each of the two
+        # _scatter_add_grad calls from repeating the int32->intp copy.
         X_ids = np.ascontiguousarray(X_coo.col[batch_idx], dtype=np.intp)
+
+        if self.engine == "numba":
+            return self._loss_and_grad_nb(Y, sample_ids, X_ids, norm, nb_work)
 
         # Build the non-reference logits directly for the sampled X features.
         Y_batch = Y[sample_ids, :]  # (B, d2)
@@ -1139,11 +1335,9 @@ class _MMvecModel:
 
         # Gradient w.r.t. Y-side embedding parameters
         dy_main = -norm * (x_main_batch.T @ delta)
-        dy_main += (self.y_main - self.y_prior_mean) / (self.y_prior_scale**2)
 
         # Y-side bias gradient is the row-wise sum over non-reference residuals.
         dy_bias = -norm * delta.sum(axis=0, keepdims=True)
-        dy_bias += (self.y_bias - self.y_prior_mean) / (self.y_prior_scale**2)
 
         # Project residuals back through the Y embeddings for the X-side gradients.
         dx_main_batch = delta @ self.y_main.T  # (B, p)
@@ -1153,43 +1347,131 @@ class _MMvecModel:
         dx_bias = np.zeros_like(self.x_bias)
 
         # Scatter-add the sampled X-side contributions back to full parameter
-        # arrays. Fused numba kernel (falls back to np.add.at if numba is absent);
-        # both paths are bit-for-bit identical, including repeated X_ids.
+        # arrays, with np.add.at accumulation semantics for repeated X_ids. Only
+        # reached on the "cython" engine; the numba engine folds this into
+        # _minibatch_grads_nb above.
         _scatter_add_grad(dx_main, X_ids, dx_main_batch, -norm, self.engine)
         _scatter_add_grad(dx_bias, X_ids, dx_bias_batch[:, None], -norm, self.engine)
 
-        # Add prior gradients
-        dx_main += (self.x_main - self.x_prior_mean) / (self.x_prior_scale**2)
-        dx_bias += (self.x_bias - self.x_prior_mean) / (self.x_prior_scale**2)
-
-        # Compute total loss (negative log posterior)
-        prior_loss = 0.0
-        prior_loss += (
-            0.5
-            * np.sum((self.x_main - self.x_prior_mean) ** 2)
-            / self._x_prior_scale_sq
-        )
-        prior_loss += (
-            0.5
-            * np.sum((self.x_bias - self.x_prior_mean) ** 2)
-            / self._x_prior_scale_sq
-        )
-        prior_loss += (
-            0.5
-            * np.sum((self.y_main - self.y_prior_mean) ** 2)
-            / self._y_prior_scale_sq
-        )
-        prior_loss += (
-            0.5
-            * np.sum((self.y_bias - self.y_prior_mean) ** 2)
-            / self._y_prior_scale_sq
-        )
+        # Add the Gaussian prior gradient and loss terms.
+        prior_loss = self._add_prior_terms(dx_main, dx_bias, dy_main, dy_bias)
 
         loss = -norm * loglik + prior_loss
 
         grads = (dx_main, dx_bias, dy_main, dy_bias)
 
         return loss, grads
+
+    def _add_prior_terms(
+        self,
+        dx_main: np.ndarray,
+        dx_bias: np.ndarray,
+        dy_main: np.ndarray,
+        dy_bias: np.ndarray,
+    ) -> float:
+        """Add the Gaussian-prior gradient terms in place; return the prior loss.
+
+        The prior contributes ``(theta - mean) / scale ** 2`` to each gradient
+        and ``0.5 * sum((theta - mean) ** 2) / scale ** 2`` to the negative log
+        posterior. It is a function of the full parameter matrices only, so it
+        is identical for every engine and independent of the mini-batch.
+
+        :meth:`loss_and_grad_fb` keeps its own copy of this arithmetic on
+        purpose: it folds the four loss terms into a running total in a
+        different order, and reusing this method there would perturb the
+        L-BFGS trajectory.
+        """
+        x_main_dev = self.x_main - self.x_prior_mean
+        x_bias_dev = self.x_bias - self.x_prior_mean
+        y_main_dev = self.y_main - self.y_prior_mean
+        y_bias_dev = self.y_bias - self.y_prior_mean
+
+        dx_main += x_main_dev / self._x_prior_scale_sq
+        dx_bias += x_bias_dev / self._x_prior_scale_sq
+        dy_main += y_main_dev / self._y_prior_scale_sq
+        dy_bias += y_bias_dev / self._y_prior_scale_sq
+
+        prior_loss = 0.5 * np.sum(x_main_dev**2) / self._x_prior_scale_sq
+        prior_loss += 0.5 * np.sum(x_bias_dev**2) / self._x_prior_scale_sq
+        prior_loss += 0.5 * np.sum(y_main_dev**2) / self._y_prior_scale_sq
+        prior_loss += 0.5 * np.sum(y_bias_dev**2) / self._y_prior_scale_sq
+        return prior_loss
+
+    def _loss_and_grad_nb(
+        self,
+        Y: np.ndarray,
+        sample_ids: np.ndarray,
+        X_ids: np.ndarray,
+        norm: float,
+        nb_work: tuple[np.ndarray, ...] | None,
+    ) -> tuple[float, Grad4Tuple]:
+        """Numba-fused mini-batch loss and gradients.
+
+        Numerically equivalent to the body of :meth:`loss_and_grad` from
+        ``Y_batch`` onward, but not bit-for-bit identical to it: the reference
+        path reduces via BLAS and NumPy's pairwise summation, which this
+        kernel's ordinary sequential loops cannot reproduce. Measured
+        agreement is at the level of double-precision rounding (see the
+        module's tests), and a seeded 15,720-iteration Adam run tracked the
+        reference losses to a relative deviation below 2e-15 throughout, with
+        no drift.
+
+        Batch sampling is not fused: Numba's RNG is not interoperable with
+        :class:`numpy.random.Generator`, so moving it into the kernel would
+        change every seeded result.
+        """
+        if nb_work is None:
+            nb_work = _nb_workspace(X_ids.shape[0], self.y_main.shape[1])
+        shifted, row_max, totals, logits_row, delta_row = nb_work
+
+        sample_ids = np.ascontiguousarray(sample_ids, dtype=np.intp)
+        dx_main = np.zeros_like(self.x_main)
+        dx_bias = np.zeros_like(self.x_bias)
+        dy_main = np.zeros_like(self.y_main)
+        dy_bias = np.zeros_like(self.y_bias)
+
+        loglik = _minibatch_logits_nb(
+            sample_ids,
+            X_ids,
+            Y,
+            self.x_main,
+            self.x_bias,
+            self.y_main,
+            self.y_bias,
+            shifted,
+            row_max,
+            totals,
+            logits_row,
+        )
+        np.exp(shifted, out=shifted)
+        loglik -= _minibatch_grads_nb(
+            sample_ids,
+            X_ids,
+            Y,
+            shifted,
+            row_max,
+            totals,
+            self.x_main,
+            self.y_main,
+            dx_main,
+            dx_bias,
+            dy_main,
+            dy_bias,
+            delta_row,
+        )
+
+        # The kernels accumulate unscaled sums; apply the batch normalization
+        # and the Gaussian prior terms, which touch the full parameter matrices
+        # rather than the mini-batch and so stay in NumPy.
+        dx_main *= -norm
+        dx_bias *= -norm
+        dy_main *= -norm
+        dy_bias *= -norm
+        prior_loss = self._add_prior_terms(dx_main, dx_bias, dy_main, dy_bias)
+
+        loss = -norm * loglik + prior_loss
+
+        return loss, (dx_main, dx_bias, dy_main, dy_bias)
 
     def pack_params(self) -> np.ndarray:
         """Flatten all parameters into a single vector.
@@ -1428,11 +1710,16 @@ def _train_lbfgs(
 
     # Precompute X feature-grouped sufficient statistics reused by every iteration.
     # y_sums groups Y counts by X feature. Each row is the total Y abundance associated
-    # with one X feature across all nonzero X entries.
-    prods_ = data[:, None] * Y[rows, :]  # (nnz, d2)
-    y_sums = np.empty((d1, d2), dtype=dtype)
-    for j in range(d2):
-        y_sums[:, j] = np.bincount(cols, weights=prods_[:, j], minlength=d1)
+    # with one X feature across all nonzero X entries, i.e.
+    #     y_sums[i, j] = sum over nonzero X entries e with col[e] == i
+    #                    of data[e] * Y[row[e], j]
+    # which is exactly the sparse-dense product X_coo.T @ Y. Evaluating it that way
+    # avoids materializing the (nnz, d2) elementwise product the column loop needed
+    # -- 0.6 GiB at 200x2000x200 and 9 GiB at 500x5000x500 -- and drops a Python
+    # loop of d2 bincount calls, each of which strided down a column of that array.
+    # Both forms accumulate over entries in ascending sample order, so the result is
+    # bit-for-bit identical (verified across scales in the module's tests).
+    y_sums = (X_coo.T @ np.asarray(Y, dtype=dtype)).astype(dtype, copy=False)
 
     # n_sums stores the corresponding grouped Y totals. It is the row sum partner to
     # y_sums and tells us how much total Y abundance is attached to each X feature.
@@ -1568,14 +1855,32 @@ def _train_adam(
     nnz = len(data)
     iter_per_epoch = max(1, nnz // batch_size)
 
+    total = data.sum()
+
     # Compute normalization factor
     if batch_norm == "legacy":
         norm = X_coo.shape[0] / batch_size
     else:  # unbiased
-        norm = data.sum() / batch_size
+        norm = total / batch_size
 
-    # Sample batch weighted by abundance
-    weights = data / data.sum()
+    # Sample batch weighted by abundance. Build the cumulative distribution
+    # once: rng.choice(..., p=weights) rebuilds and revalidates it over all nnz
+    # entries on every one of the (max_iter * nnz / batch_size) mini-batches,
+    # which at realistic sizes costs more than the gradient computation it
+    # feeds.
+    if data.min() < 0:
+        # rng.choice(..., p=weights) used to reject this; searchsorted over a
+        # non-monotone cdf would instead sample nonsense or raise IndexError
+        # from deep inside loss_and_grad.
+        raise ValueError("X contains negative counts, which cannot be sampled.")
+    cdf = (data / total).cumsum()
+    cdf /= cdf[-1]
+
+    nb_work = (
+        _nb_workspace(batch_size, model.y_main.shape[1])
+        if model.engine == "numba"
+        else None
+    )
 
     it = 0
     for epoch in range(max_iter):
@@ -1583,7 +1888,9 @@ def _train_adam(
             it += 1
 
             # Compute loss and gradients
-            loss, grads = model.loss_and_grad(X_coo, Y, batch_size, norm, weights, rng)
+            loss, grads = model.loss_and_grad(
+                X_coo, Y, batch_size, norm, cdf, rng, nb_work
+            )
 
             # Gradient clipping
             dx_main, dx_bias, dy_main, dy_bias = _clip_gradients(grads, clipnorm)

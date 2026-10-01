@@ -262,14 +262,15 @@ class TestMMvecGradients(unittest.TestCase):
         )
         X_coo = coo_array(X)
         data = X_coo.data
-        weights = data / data.sum()
+        cdf = (data / data.sum()).cumsum()
+        cdf /= cdf[-1]
 
         # Compute analytical gradients with fixed seed for reproducibility
         seed = 123
         size = 10
         norm = n_features_x / size
         _, grads = model.loss_and_grad(
-            X_coo, Y, size, norm, weights, np.random.default_rng(seed)
+            X_coo, Y, size, norm, cdf, np.random.default_rng(seed)
         )
         grads = dict(zip(["x_main", "x_bias", "y_main", "y_bias"], grads))
 
@@ -284,11 +285,11 @@ class TestMMvecGradients(unittest.TestCase):
                 original = param[idx]
                 param[idx] = original + eps
                 loss_plus, _ = model.loss_and_grad(
-                    X_coo, Y, size, norm, weights, np.random.default_rng(seed)
+                    X_coo, Y, size, norm, cdf, np.random.default_rng(seed)
                 )
                 param[idx] = original - eps
                 loss_minus, _ = model.loss_and_grad(
-                    X_coo, Y, size, norm, weights, np.random.default_rng(seed)
+                    X_coo, Y, size, norm, cdf, np.random.default_rng(seed)
                 )
                 param[idx] = original  # restore
 
@@ -1094,7 +1095,7 @@ class TestScatterAddGrad(unittest.TestCase):
 
     @numba_code
     def test_loss_and_grad_numba_matches_fallback(self):
-        """loss_and_grad gives identical gradients via Numba and np.add.at."""
+        """The fused Numba engine reproduces the NumPy engine's loss/gradients."""
         n_features_x = 5
         n_features_y = 8
         n_components = 2
@@ -1116,22 +1117,77 @@ class TestScatterAddGrad(unittest.TestCase):
         X = data_rng.integers(0, 100, size=(n_samples, n_features_x)).astype(np.float64)
         Y = data_rng.integers(0, 100, size=(n_samples, n_features_y)).astype(np.float64)
         X_coo = coo_array(X)
-        weights = X_coo.data / X_coo.data.sum()
+        cdf = (X_coo.data / X_coo.data.sum()).cumsum()
+        cdf /= cdf[-1]
         size = 10
         norm = 5 / size
 
         model.engine = "numba"
-        _, g_nb = model.loss_and_grad(
-            X_coo, Y, size, norm, weights, np.random.default_rng(123)
+        loss_nb, g_nb = model.loss_and_grad(
+            X_coo, Y, size, norm, cdf, np.random.default_rng(123)
         )
 
         model.engine = "cython"
-        _, g_ref = model.loss_and_grad(
-            X_coo, Y, size, norm, weights, np.random.default_rng(123)
+        loss_ref, g_ref = model.loss_and_grad(
+            X_coo, Y, size, norm, cdf, np.random.default_rng(123)
         )
 
+        # Not bit-for-bit: the fused kernels reduce sequentially, while the
+        # NumPy path reduces via BLAS and pairwise summation. The tolerance
+        # below is a few orders of magnitude above the deviation actually
+        # observed (~1e-15 relative) and still far tighter than anything that
+        # could perturb a training run.
+        npt.assert_allclose(loss_nb, loss_ref, rtol=1e-12)
         for a, b in zip(g_nb, g_ref):
-            npt.assert_array_equal(a, b)
+            npt.assert_allclose(a, b, rtol=1e-10, atol=1e-10 * np.abs(b).max())
+
+
+    def test_mmvec_numba_engine_matches_cython_end_to_end(self):
+        """A full seeded Adam fit agrees between engines on DataFrame input.
+
+        Covers what the single-call test cannot: the DataFrame ingest path
+        (which yields an F-contiguous, integer-dtype array before `fit`
+        copies it to C order), the reusable workspace across many
+        iterations, and accumulated drift over a whole training run.
+        """
+        X, Y, *_ = random_multimodal(8, 10, 50, seed=42)
+        params = dict(dimensions=2, optimizer="adam", max_iter=50, seed=42)
+        ref = mmvec(X, Y, engine="cython", **params)
+        obs = mmvec(X, Y, engine="numba", **params)
+
+        for name in ("ranks", "x_embeddings", "y_embeddings", "convergence"):
+            a = np.asarray(getattr(ref, name), dtype=float)
+            b = np.asarray(getattr(obs, name), dtype=float)
+            npt.assert_allclose(
+                b, a, rtol=1e-9, atol=1e-9 * np.abs(a).max(), err_msg=name
+            )
+
+
+    def test_lbfgs_sufficient_statistics_match_reference(self):
+        """y_sums = X_coo.T @ Y must equal the grouped reference exactly.
+
+        _train_lbfgs computes its X-feature-grouped Y totals as a sparse-dense
+        product instead of accumulating them with a per-column bincount. The
+        two agree bit-for-bit only because both sum contributions in ascending
+        sample order. That is worth pinning: L-BFGS amplifies a 1e-16 relative
+        gradient perturbation into ~1e-2 relative differences in the returned
+        ranks, so a summation-order change here would silently move results.
+        """
+        rng = np.random.default_rng(0)
+        for n_samples, d1, d2 in ((20, 8, 12), (60, 15, 40), (100, 25, 90)):
+            X = rng.integers(0, 30, size=(n_samples, d1)).astype(np.float64)
+            X[rng.random(X.shape) < 0.4] = 0.0  # keep it genuinely sparse
+            Y = rng.integers(0, 50, size=(n_samples, d2)).astype(np.float64)
+            X_coo = coo_array(X)
+
+            reference = np.empty((d1, d2))
+            prods = X_coo.data[:, None] * Y[X_coo.row, :]
+            for j in range(d2):
+                reference[:, j] = np.bincount(
+                    X_coo.col, weights=prods[:, j], minlength=d1
+                )
+
+            npt.assert_array_equal(X_coo.T @ Y, reference)
 
 
 if __name__ == "__main__":
