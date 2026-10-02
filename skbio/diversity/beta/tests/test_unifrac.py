@@ -734,6 +734,46 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         self.assertAlmostEqual(
             _weighted_unifrac(m[:, 1], m[:, 2], m1s, m2s, bl)[0], 4.5)
 
+    def test_weighted_unifrac_variance_adjust_matches_ssu_fixture_unnormalized(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture('weighted_unifrac_vaw_dm.txt')
+        for i, j in [(0, 1), (2, 5), (3, 7)]:
+            obs = weighted_unifrac(table[i], table[j], taxa, tree, variance_adjust=True)
+            self.assertAlmostEqual(
+                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+
+    def test_weighted_unifrac_variance_adjust_matches_ssu_fixture_normalized(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture('weighted_normalized_unifrac_vaw_dm.txt')
+        for i, j in [(0, 1), (2, 5), (3, 7)]:
+            obs = weighted_unifrac(
+                table[i], table[j], taxa, tree, normalized=True, variance_adjust=True
+            )
+            self.assertAlmostEqual(
+                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+
+    @skipIf(NUMBA_AVAILABLE, "numba is installed")
+    def test_weighted_unifrac_variance_adjust_requires_numba(self):
+        with self.assertRaises(ImportError):
+            weighted_unifrac(
+                self.b1[0], self.b1[1], self.oids1, self.t1,
+                variance_adjust=True,
+            )
+
+    def test_weighted_unifrac_both_empty_variance_adjust_normalized_is_zero(self):
+        obs = weighted_unifrac(
+            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
+            normalized=True, variance_adjust=True,
+        )
+        self.assertEqual(obs, 0.0)
+
+    def test_weighted_unifrac_both_empty_variance_adjust_unnormalized_is_zero(self):
+        obs = weighted_unifrac(
+            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
+            variance_adjust=True,
+        )
+        self.assertEqual(obs, 0.0)
+
     @numba_code
     def test_unweighted_unifrac_engine_numba_matches_cython(self):
         dm_cy = beta_diversity(
