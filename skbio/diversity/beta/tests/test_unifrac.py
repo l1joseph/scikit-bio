@@ -21,10 +21,11 @@ from skbio.diversity.beta._unifrac import (_unweighted_unifrac,
                                            _weighted_unifrac_branch_correction,
                                            NUMBA_AVAILABLE)
 from skbio.diversity._driver import _UNIFRAC_FAST_ENGINE
+from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
 from skbio.util import numba_code
 
 
-class UnifracTests(TestCase):
+class UnifracTests(QiimeTinyTestMixin, TestCase):
 
     def setUp(self):
         self.b1 = np.array(
@@ -407,6 +408,48 @@ class UnifracTests(TestCase):
             self.b1[4], self.b1[5], self.oids1, self.t1)
         expected = 1.0
         self.assertAlmostEqual(actual, expected)
+
+    def test_unweighted_unifrac_unnormalized_matches_ssu_fixture(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
+        for i, j in [(0, 1), (2, 5), (3, 7)]:
+            obs = unweighted_unifrac(
+                table[i], table[j], taxa, tree, normalized=False
+            )
+            self.assertAlmostEqual(
+                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+
+    def test_unweighted_unifrac_variance_adjust_matches_ssu_fixture(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
+        for i, j in [(0, 1), (2, 5), (3, 7)]:
+            obs = unweighted_unifrac(
+                table[i], table[j], taxa, tree, variance_adjust=True
+            )
+            self.assertAlmostEqual(
+                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+
+    @skipIf(NUMBA_AVAILABLE, "numba is installed")
+    def test_unweighted_unifrac_variance_adjust_requires_numba(self):
+        with self.assertRaises(ImportError):
+            unweighted_unifrac(
+                [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1,
+                variance_adjust=True,
+            )
+
+    def test_unweighted_unifrac_both_empty_unnormalized_is_zero(self):
+        obs = unweighted_unifrac(
+            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
+            normalized=False,
+        )
+        self.assertEqual(obs, 0.0)
+
+    def test_unweighted_unifrac_both_empty_variance_adjust_is_zero(self):
+        obs = unweighted_unifrac(
+            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
+            variance_adjust=True,
+        )
+        self.assertEqual(obs, 0.0)
 
     def test_weighted_unifrac_identity(self):
         for i in range(len(self.b1)):
