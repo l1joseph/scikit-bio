@@ -19,6 +19,7 @@ from skbio.diversity.beta import unweighted_unifrac, weighted_unifrac
 from skbio.diversity.beta._unifrac import (_unweighted_unifrac,
                                            _weighted_unifrac,
                                            _weighted_unifrac_branch_correction,
+                                           _weighted_unifrac_pdist_numba,
                                            NUMBA_AVAILABLE)
 from skbio.diversity._driver import _UNIFRAC_FAST_ENGINE
 from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
@@ -773,6 +774,34 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
             variance_adjust=True,
         )
         self.assertEqual(obs, 0.0)
+
+    @numba_code
+    def test_weighted_unifrac_variance_adjust_engine_numba_matches_single_pair(self):
+        # The variance_adjust path of the numba pdist kernel
+        # (_weighted_unifrac_pdist_numba / _weighted_unifrac_pdist_nb) has no
+        # cython/pairwise_func counterpart to compare against (beta_diversity
+        # does not yet wire variance_adjust through for weighted_unifrac), so
+        # cross-check it directly against the single-pair weighted_unifrac
+        # path for every pair in the tiny-test table -- that path is already
+        # validated against the SSU fixtures above, so this transitively
+        # confirms the kernel's variance_adjust branch for every pair, not
+        # just the 3 spot checks used elsewhere in this file.
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        n = table.shape[0]
+        for normalized in (False, True):
+            condensed = _weighted_unifrac_pdist_numba(
+                table, taxa, tree, normalized, True, variance_adjust=True,
+            )
+            obs = DistanceMatrix(condensed, sample_ids)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    expected = weighted_unifrac(
+                        table[i], table[j], taxa, tree,
+                        normalized=normalized, variance_adjust=True,
+                    )
+                    self.assertAlmostEqual(
+                        obs[sample_ids[i], sample_ids[j]], expected, places=10,
+                    )
 
     @numba_code
     def test_unweighted_unifrac_engine_numba_matches_cython(self):
