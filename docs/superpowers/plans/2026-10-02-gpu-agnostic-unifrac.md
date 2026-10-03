@@ -1391,90 +1391,25 @@ git commit -m "feat: wire engine='gpu' into unifrac public API and beta_diversit
 
 ## Task 11: NRP (NVIDIA) end-to-end verification
 
+**Revised 2026-10-02:** no custom container image, no registry. NRP is just Kubernetes — use a public NVIDIA CUDA base image and install everything (scikit-bio included) at pod startup via pip/git, so nothing needs pushing anywhere and no registry credentials are needed inside or outside the pod. The scikit-bio branch must be reachable via a public (or at least pip-installable) git URL for this to work — push the current branch to the `fork` remote (`git@github.com:l1joseph/scikit-bio.git`) first if it isn't already there.
+
 **Files:**
-- Create (dev-only, scratch): `/cosmos/vast/scratch/l1joseph/unifrac-bench/nrp/Dockerfile`
 - Create (dev-only, scratch): `/cosmos/vast/scratch/l1joseph/unifrac-bench/nrp/job.yaml`
-- Create (dev-only, scratch): `/cosmos/vast/scratch/l1joseph/unifrac-bench/nrp/verify.py`
 
 **Interfaces:**
-- Produces: a passing run on an NRP A100 node confirming `weighted_unifrac_gpu`/`unweighted_unifrac_gpu`/`generalized_unifrac_gpu` (Tasks 7-9) match the `ssu` fixtures (Task 1) within a measured tolerance, on real NVIDIA hardware via `numba-cuda`.
+- Produces: a passing run on an NRP A100 node confirming `weighted_unifrac_gpu`/`unweighted_unifrac_gpu`/`generalized_unifrac_gpu` (Tasks 7-9) match all 11 `ssu` fixtures (Task 1) within a measured tolerance, on real NVIDIA hardware via `numba-cuda`.
 
-- [ ] **Step 1: Write the Dockerfile**
-
-```dockerfile
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
-RUN apt-get update && apt-get install -y python3-pip git && rm -rf /var/lib/apt/lists/*
-RUN pip install numpy numba numba-cuda biom-format
-WORKDIR /app
-COPY . /app
-CMD ["python3", "verify.py"]
-```
-
-- [ ] **Step 2: Write the verification script**
-
-```python
-# nrp/verify.py
-import sys
-sys.path.insert(0, "/app/scikit-bio")  # repo checked out into the image, see Step 3
-import numpy as np
-from skbio import TreeNode, DistanceMatrix
-from skbio.diversity.beta._unifrac_gpu import (
-    detect_gpu_backend, weighted_unifrac_gpu, unweighted_unifrac_gpu,
-    generalized_unifrac_gpu,
-)
-
-backend = detect_gpu_backend()
-print(f"Detected GPU backend: {backend}", flush=True)
-assert backend == "cuda", f"expected cuda backend on NRP, got {backend}"
-
-import pandas as pd
-df = pd.read_csv("/app/fixtures/otu-table.tsv", sep="\t", skiprows=1, index_col=0)
-taxa = df.index.astype(str).tolist()
-sample_ids = df.columns.tolist()
-table = df.T.values
-tree = TreeNode.read("/app/fixtures/tree.nwk")
-
-checks = [
-    ("weighted_unnormalized", weighted_unifrac_gpu(table, taxa, tree, False, False), "weighted_unifrac_dm.txt"),
-    ("weighted_normalized", weighted_unifrac_gpu(table, taxa, tree, True, False), "weighted_normalized_unifrac_dm.txt"),
-    ("unweighted", unweighted_unifrac_gpu(table, taxa, tree, True, False), "unweighted_unifrac_dm.txt"),
-    ("unweighted_unnormalized", unweighted_unifrac_gpu(table, taxa, tree, False, False), "unweighted_unnormalized_unifrac_dm.txt"),
-    ("generalized_alpha1.0", generalized_unifrac_gpu(table, taxa, tree, 1.0, False), "generalized_unifrac_alpha1.0_dm.txt"),
-]
-
-from scipy.spatial.distance import squareform
-max_dev = 0.0
-for name, condensed, fixture_name in checks:
-    expected_dm = DistanceMatrix.read(f"/app/fixtures/{fixture_name}")
-    expected_condensed = expected_dm.condensed_form()
-    dev = np.abs(condensed - expected_condensed).max()
-    max_dev = max(max_dev, dev)
-    print(f"{name}: max abs deviation = {dev:.3e}", flush=True)
-
-print(f"OVERALL max abs deviation across all methods: {max_dev:.3e}", flush=True)
-assert max_dev < 1e-6, f"deviation {max_dev} exceeds threshold"
-print("ALL CHECKS PASSED", flush=True)
-```
-
-- [ ] **Step 3: Assemble the build context and build/push the image**
+- [ ] **Step 1: Push the branch to the public fork**
 
 ```bash
-cd /cosmos/vast/scratch/l1joseph/unifrac-bench/nrp
-git clone --depth 1 /cosmos/nfs/home/l1joseph/scikit-bio scikit-bio
-mkdir -p fixtures
-cp /cosmos/nfs/home/l1joseph/scikit-bio/skbio/diversity/beta/tests/data/qiime-191-tt/*.txt \
-   /cosmos/nfs/home/l1joseph/scikit-bio/skbio/diversity/beta/tests/data/qiime-191-tt/*.tsv \
-   /cosmos/nfs/home/l1joseph/scikit-bio/skbio/diversity/beta/tests/data/qiime-191-tt/*.nwk \
-   fixtures/
-docker build -t gitlab-registry.nrp-nautilus.io/l1joseph/unifrac-gpu-verify:latest .
-docker push gitlab-registry.nrp-nautilus.io/l1joseph/unifrac-gpu-verify:latest
+cd /cosmos/nfs/home/l1joseph/scikit-bio/.claude/worktrees/gpu-agnostic-unifrac
+git push fork worktree-gpu-agnostic-unifrac
 ```
+Confirm it's actually reachable publicly: `curl -sL https://raw.githubusercontent.com/l1joseph/scikit-bio/worktree-gpu-agnostic-unifrac/pyproject.toml | head -5` should print real file content, not a 404 or an auth-wall page. If the fork is private, this step blocks here — report BLOCKED rather than guessing around it (don't fall back to a registry/image approach without checking with the controller first, that's explicitly what this revision is trying to avoid).
 
-(Requires NRP GitLab registry credentials and `docker login gitlab-registry.nrp-nautilus.io` to be set up already — if not, this is a one-time manual setup step to do before this task, not scripted here since it involves credentials per the global credential-handling rule.)
+- [ ] **Step 2: Write the Kubernetes job manifest**
 
-- [ ] **Step 4: Write the Kubernetes job manifest**
-
-Modeled on the real, existing `knightlab-ml` namespace job pattern (`oceanpredict-st10-train-a100-001`, confirmed via `kubectl get job ... -o yaml` during planning):
+Modeled on the real, existing `knightlab-ml` namespace job pattern (`oceanpredict-st10-train-a100-001`, confirmed via `kubectl get job ... -o yaml` during planning). The container installs numba-cuda and the scikit-bio branch at startup, then runs an inline Python verification script via a heredoc — no image build, no `COPY`, no registry:
 
 ```yaml
 # nrp/job.yaml
@@ -1498,7 +1433,7 @@ spec:
                 values: ["NVIDIA-A100-SXM4-40GB", "NVIDIA-A100-SXM4-80GB", "NVIDIA-A100-80GB-PCIe"]
       containers:
       - name: verify
-        image: gitlab-registry.nrp-nautilus.io/l1joseph/unifrac-gpu-verify:latest
+        image: nvidia/cuda:12.4.1-devel-ubuntu22.04
         resources:
           limits:
             cpu: "2"
@@ -1508,21 +1443,76 @@ spec:
             cpu: "2"
             memory: 8Gi
             nvidia.com/a100: "1"
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -euo pipefail
+            apt-get update -qq && apt-get install -y -qq python3-pip git > /dev/null
+            pip install -q numba numba-cuda
+            pip install -q "git+https://github.com/l1joseph/scikit-bio.git@worktree-gpu-agnostic-unifrac"
+            python3 - <<'PYEOF'
+            import numpy as np
+            import pandas as pd
+            from skbio import TreeNode, DistanceMatrix
+            from skbio.util._testing import get_data_path
+            from skbio.diversity.beta._unifrac_gpu import (
+                detect_gpu_backend, weighted_unifrac_gpu, unweighted_unifrac_gpu,
+                generalized_unifrac_gpu,
+            )
+
+            backend = detect_gpu_backend()
+            print(f"Detected GPU backend: {backend}", flush=True)
+            assert backend == "cuda", f"expected cuda backend on NRP, got {backend}"
+
+            base = get_data_path('qiime-191-tt', subfolder='data')
+            df = pd.read_csv(f'{base}/otu-table.tsv', sep='\t', skiprows=1, index_col=0)
+            taxa = df.index.astype(str).tolist()
+            table = df.T.values
+            tree = TreeNode.read(f'{base}/tree.nwk')
+
+            checks = [
+                ("weighted_unnormalized", weighted_unifrac_gpu(table, taxa, tree, False, False), "weighted_unifrac_dm.txt"),
+                ("weighted_normalized", weighted_unifrac_gpu(table, taxa, tree, True, False), "weighted_normalized_unifrac_dm.txt"),
+                ("weighted_unnormalized_vaw", weighted_unifrac_gpu(table, taxa, tree, False, True), "weighted_unifrac_vaw_dm.txt"),
+                ("weighted_normalized_vaw", weighted_unifrac_gpu(table, taxa, tree, True, True), "weighted_normalized_unifrac_vaw_dm.txt"),
+                ("unweighted", unweighted_unifrac_gpu(table, taxa, tree, True, False), "unweighted_unifrac_dm.txt"),
+                ("unweighted_unnormalized", unweighted_unifrac_gpu(table, taxa, tree, False, False), "unweighted_unnormalized_unifrac_dm.txt"),
+                ("unweighted_vaw", unweighted_unifrac_gpu(table, taxa, tree, True, True), "unweighted_unifrac_vaw_dm.txt"),
+                ("unweighted_unnormalized_vaw", unweighted_unifrac_gpu(table, taxa, tree, False, True), "unweighted_unnormalized_unifrac_vaw_dm.txt"),
+                ("generalized_alpha0.5", generalized_unifrac_gpu(table, taxa, tree, 0.5, False), "generalized_unifrac_alpha0.5_dm.txt"),
+                ("generalized_alpha1.0", generalized_unifrac_gpu(table, taxa, tree, 1.0, False), "generalized_unifrac_alpha1.0_dm.txt"),
+                ("generalized_alpha1.0_vaw", generalized_unifrac_gpu(table, taxa, tree, 1.0, True), "generalized_unifrac_alpha1.0_vaw_dm.txt"),
+            ]
+
+            max_dev = 0.0
+            for name, condensed, fixture_name in checks:
+                expected_dm = DistanceMatrix.read(f'{base}/{fixture_name}')
+                expected_condensed = expected_dm.condensed_form()
+                dev = np.abs(condensed - expected_condensed).max()
+                max_dev = max(max_dev, dev)
+                print(f"{name}: max abs deviation = {dev:.3e}", flush=True)
+
+            print(f"OVERALL max abs deviation across all methods: {max_dev:.3e}", flush=True)
+            assert max_dev < 1e-6, f"deviation {max_dev} exceeds threshold"
+            print("ALL CHECKS PASSED", flush=True)
+            PYEOF
 ```
 
-- [ ] **Step 5: Submit and check the job**
+Before trusting `get_data_path(...)` here, confirm it actually resolves correctly for a plain (non-editable) `pip install git+...` — it's primarily used in-repo for editable/test checkouts; read `skbio/util/_testing.py`'s implementation and verify it resolves paths relative to the installed package's own `__file__`, not something that only works in a source checkout. If it doesn't work this way, adapt (e.g. construct the path via `importlib.resources` relative to `skbio.diversity.beta.tests` directly) rather than assuming.
+
+- [ ] **Step 3: Submit and check the job**
 
 ```bash
 kubectl apply -f /cosmos/vast/scratch/l1joseph/unifrac-bench/nrp/job.yaml
-kubectl wait --for=condition=complete --timeout=600s job/unifrac-gpu-verify-001 -n knightlab-ml || \
+kubectl wait --for=condition=complete --timeout=900s job/unifrac-gpu-verify-001 -n knightlab-ml || \
   kubectl logs job/unifrac-gpu-verify-001 -n knightlab-ml
-kubectl logs job/unifrac-gpu-verify-001 -n knightlab-ml
+kubectl logs job/unifrac-gpu-verify-001 -n knightlab-ml | tee /cosmos/vast/scratch/l1joseph/unifrac-bench/nrp/nrp-verify.log
 ```
-Expected: log output ending in `ALL CHECKS PASSED`, with the printed `OVERALL max abs deviation` figure.
+Expected: log output ending in `ALL CHECKS PASSED`, with all 11 `max abs deviation` lines and the printed `OVERALL` figure. Allow extra time on the first run for `apt-get`/`pip install` inside the pod (no image caching since there's no custom image).
 
-- [ ] **Step 6: Record the measured tolerance and clean up**
+- [ ] **Step 4: Record the measured tolerance and clean up**
 
-Copy the printed `OVERALL max abs deviation` value into this plan's Task 13 (tolerance finalization) and into the spec, then delete the job:
+Copy the printed `OVERALL max abs deviation` value and all 11 per-method figures into this plan's Task 13 (tolerance finalization) and into the spec, then delete the job:
 
 ```bash
 kubectl delete job unifrac-gpu-verify-001 -n knightlab-ml
