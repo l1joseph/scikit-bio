@@ -9,6 +9,7 @@
 import warnings
 from io import StringIO
 from unittest import main, TestCase, skipIf
+from unittest.mock import patch
 
 import numpy as np
 
@@ -847,6 +848,28 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         # variance_adjust=True.
         with self.assertRaises(ImportError):
             generalized_unifrac([1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1)
+
+    def test_generalized_unifrac_no_numba_bad_alpha_raises_importerror(self):
+        # Regression test: the numba-availability check must still run (and
+        # raise ImportError) before alpha-range validation on the default
+        # (non-'gpu') engine path, exactly as it did before `engine` was
+        # added. Monkeypatches NUMBA_AVAILABLE=False (rather than relying on
+        # @skipIf like test_generalized_unifrac_requires_numba above) so
+        # this exercises the ordering on a machine where numba IS installed.
+        with patch("skbio.diversity.beta._unifrac.NUMBA_AVAILABLE", False):
+            with self.assertRaises(ImportError):
+                generalized_unifrac(
+                    [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1, alpha=1.5,
+                )
+
+    def test_beta_diversity_gen_unifrac_no_numba_bad_alpha_raises_importerror(self):
+        # beta_diversity counterpart of the regression test above.
+        with patch("skbio.diversity._driver.NUMBA_AVAILABLE", False):
+            with self.assertRaises(ImportError):
+                beta_diversity(
+                    "generalized_unifrac", self.b1, ids=self.sids1,
+                    taxa=self.oids1, tree=self.t1, alpha=1.5,
+                )
 
     @numba_code
     def test_generalized_unifrac_pdist_numba_matches_single_pair(self):

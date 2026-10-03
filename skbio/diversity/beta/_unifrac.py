@@ -1274,8 +1274,6 @@ def generalized_unifrac(
        Bioinformatics 28, 2106-2113 (2012).
 
     """
-    if not (0.0 <= alpha <= 1.0):
-        raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
     if engine == "gpu":
         from skbio.diversity.beta._unifrac_gpu import (
             detect_gpu_backend, generalized_unifrac_gpu,
@@ -1285,6 +1283,11 @@ def generalized_unifrac(
                 "engine='gpu' was requested but no usable GPU backend "
                 "(numba-cuda or numba.hip) was found."
             )
+    elif not NUMBA_AVAILABLE:
+        raise ImportError("generalized_unifrac requires numba.")
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+    if engine == "gpu":
         # Single-pair GPU dispatch is wasteful (kernel launch overhead for
         # one pair); route through the same GPU pdist driver beta_diversity
         # uses, with a 2-row input.
@@ -1294,8 +1297,6 @@ def generalized_unifrac(
             variance_adjust=variance_adjust, validate=validate,
         )
         return distances[0]
-    if not NUMBA_AVAILABLE:
-        raise ImportError("generalized_unifrac requires numba.")
     (
         u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index,
     ) = _setup_pairwise_unifrac(

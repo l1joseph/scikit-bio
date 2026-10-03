@@ -445,8 +445,6 @@ def beta_diversity(
     elif metric == "generalized_unifrac":
         alpha = kwargs.pop("alpha", 1.0)
         variance_adjust = kwargs.pop("variance_adjust", False)
-        if not (0.0 <= alpha <= 1.0):
-            raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
         if engine == "gpu":
             from skbio.diversity.beta._unifrac_gpu import (
                 detect_gpu_backend, generalized_unifrac_gpu,
@@ -456,13 +454,16 @@ def beta_diversity(
                     "engine='gpu' was requested but no usable GPU backend "
                     "(numba-cuda or numba.hip) was found."
                 )
+        elif not NUMBA_AVAILABLE:
+            raise ImportError("generalized_unifrac requires numba.")
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+        if engine == "gpu":
             distances = generalized_unifrac_gpu(
                 counts, taxa, tree, alpha=alpha,
                 variance_adjust=variance_adjust, validate=validate,
             )
             return DistanceMatrix(distances, ids)
-        if not NUMBA_AVAILABLE:
-            raise ImportError("generalized_unifrac requires numba.")
         distances = _generalized_unifrac_pdist_numba(
             counts, taxa=taxa, tree=tree, alpha=alpha,
             variance_adjust=variance_adjust, validate=validate,
