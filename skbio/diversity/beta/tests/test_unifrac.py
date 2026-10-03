@@ -1127,6 +1127,18 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 "unweighted_unifrac", self.b1, ids=self.sids1,
                 taxa=self.oids1, tree=self.t1, engine="julia")
 
+    def test_beta_diversity_generalized_unifrac_engine_invalid(self):
+        # generalized_unifrac has no cython/numba choice to resolve (it has
+        # no cython path at all), so unlike unweighted_unifrac/
+        # weighted_unifrac above, this branch never called anything that
+        # validated `engine`; a typo such as 'bogus' or 'cuda' used to fall
+        # through and silently run the CPU numba path.
+        for bad in ('bogus', 'cuda', 'GPU', 'numba', 'cython'):
+            with self.assertRaisesRegex(ValueError, 'engine'):
+                beta_diversity(
+                    "generalized_unifrac", self.b1, ids=self.sids1,
+                    taxa=self.oids1, tree=self.t1, engine=bad)
+
     @numba_code
     def test_beta_diversity_engine_numba_with_pairwise_func_is_used(self):
         calls = []

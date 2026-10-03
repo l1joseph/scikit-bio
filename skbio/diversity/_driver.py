@@ -26,6 +26,7 @@ from skbio.diversity.beta._unifrac import (
     _unweighted_unifrac_pdist_numba,
     _weighted_unifrac_pdist_numba,
     _generalized_unifrac_pdist_numba,
+    _validate_unifrac_engine,
     NUMBA_AVAILABLE,
 )
 from skbio.stats.distance import DistanceMatrix
@@ -539,6 +540,7 @@ def beta_diversity(
             counts, taxa=taxa, tree=tree, normalized=normalized, validate=validate
         )
     elif metric == "generalized_unifrac":
+        _validate_unifrac_engine(engine)
         alpha = kwargs.pop("alpha", 1.0)
         variance_adjust = kwargs.pop("variance_adjust", False)
         if engine == "gpu":
