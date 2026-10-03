@@ -23,7 +23,9 @@ from skbio.diversity.beta._unifrac import (_unweighted_unifrac,
                                            _weighted_unifrac_branch_correction,
                                            _unweighted_unifrac_pdist_numba,
                                            _weighted_unifrac_pdist_numba,
+                                           _generalized_unifrac,
                                            _generalized_unifrac_pdist_numba,
+                                           _setup_pairwise_unifrac,
                                            NUMBA_AVAILABLE)
 from skbio.diversity._driver import _UNIFRAC_FAST_ENGINE
 from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
@@ -422,64 +424,24 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         expected = 1.0
         self.assertAlmostEqual(actual, expected)
 
-    def test_unweighted_unifrac_unnormalized_matches_ssu_fixture(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
-        for i, j in [(0, 1), (2, 5), (3, 7)]:
-            obs = unweighted_unifrac(
-                table[i], table[j], taxa, tree, normalized=False
-            )
-            self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]],
-                delta=SSU_FIXTURE_TOLERANCE)
+    # Fixture-matched coverage for normalized=False and variance_adjust=True
+    # on unweighted_unifrac now lives in test_unifrac_gpu.py: those options
+    # are GPU-only in this release, with CPU/numba support planned for a
+    # future PR (see the NotImplementedError tests below).
 
-    def test_unweighted_unifrac_variance_adjust_matches_ssu_fixture(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
-        for i, j in [(0, 1), (2, 5), (3, 7)]:
-            obs = unweighted_unifrac(
-                table[i], table[j], taxa, tree, variance_adjust=True
+    def test_unweighted_unifrac_normalized_false_requires_gpu(self):
+        with self.assertRaises(NotImplementedError):
+            unweighted_unifrac(
+                [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1,
+                normalized=False,
             )
-            self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]],
-                delta=SSU_FIXTURE_TOLERANCE)
 
-    def test_unweighted_unifrac_unnormalized_variance_adjust_matches_ssu_fixture(
-        self,
-    ):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture(
-            'unweighted_unnormalized_unifrac_vaw_dm.txt')
-        for i, j in [(0, 1), (2, 5), (3, 7)]:
-            obs = unweighted_unifrac(
-                table[i], table[j], taxa, tree,
-                normalized=False, variance_adjust=True,
-            )
-            self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]],
-                delta=SSU_FIXTURE_TOLERANCE)
-
-    @skipIf(NUMBA_AVAILABLE, "numba is installed")
-    def test_unweighted_unifrac_variance_adjust_requires_numba(self):
-        with self.assertRaises(ImportError):
+    def test_unweighted_unifrac_variance_adjust_requires_gpu(self):
+        with self.assertRaises(NotImplementedError):
             unweighted_unifrac(
                 [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1,
                 variance_adjust=True,
             )
-
-    def test_unweighted_unifrac_both_empty_unnormalized_is_zero(self):
-        obs = unweighted_unifrac(
-            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
-            normalized=False,
-        )
-        self.assertEqual(obs, 0.0)
-
-    def test_unweighted_unifrac_both_empty_variance_adjust_is_zero(self):
-        obs = unweighted_unifrac(
-            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
-            variance_adjust=True,
-        )
-        self.assertEqual(obs, 0.0)
 
     def test_weighted_unifrac_identity(self):
         for i in range(len(self.b1)):
@@ -764,150 +726,114 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         self.assertAlmostEqual(
             _weighted_unifrac(m[:, 1], m[:, 2], m1s, m2s, bl)[0], 4.5)
 
-    def test_weighted_unifrac_variance_adjust_matches_ssu_fixture_unnormalized(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture('weighted_unifrac_vaw_dm.txt')
-        for i, j in [(0, 1), (2, 5), (3, 7)]:
-            obs = weighted_unifrac(table[i], table[j], taxa, tree, variance_adjust=True)
-            self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]],
-                delta=SSU_FIXTURE_TOLERANCE)
+    # Fixture-matched coverage for weighted_unifrac's variance_adjust now
+    # lives in test_unifrac_gpu.py: that option is GPU-only in this release,
+    # with CPU/numba support planned for a future PR (see the
+    # NotImplementedError test below).
 
-    def test_weighted_unifrac_variance_adjust_matches_ssu_fixture_normalized(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture('weighted_normalized_unifrac_vaw_dm.txt')
-        for i, j in [(0, 1), (2, 5), (3, 7)]:
-            obs = weighted_unifrac(
-                table[i], table[j], taxa, tree, normalized=True, variance_adjust=True
-            )
-            self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]],
-                delta=SSU_FIXTURE_TOLERANCE)
-
-    @skipIf(NUMBA_AVAILABLE, "numba is installed")
-    def test_weighted_unifrac_variance_adjust_requires_numba(self):
-        with self.assertRaises(ImportError):
+    def test_weighted_unifrac_variance_adjust_requires_gpu(self):
+        with self.assertRaises(NotImplementedError):
             weighted_unifrac(
                 self.b1[0], self.b1[1], self.oids1, self.t1,
                 variance_adjust=True,
             )
 
-    def test_weighted_unifrac_both_empty_variance_adjust_normalized_is_zero(self):
-        obs = weighted_unifrac(
-            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
-            normalized=True, variance_adjust=True,
-        )
-        self.assertEqual(obs, 0.0)
-
-    def test_weighted_unifrac_both_empty_variance_adjust_unnormalized_is_zero(self):
-        obs = weighted_unifrac(
-            [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], self.oids1, self.t1,
-            variance_adjust=True,
-        )
-        self.assertEqual(obs, 0.0)
+    # generalized_unifrac ships GPU-only in this release; CPU/numba support
+    # is planned for a future PR. The CPU kernel (_generalized_unifrac /
+    # _generalized_unifrac_pdist_numba) stays in skbio.diversity.beta._unifrac
+    # as the reference that future PR can build from, so the fixture- and
+    # kernel-correctness checks below exercise it directly rather than
+    # through the public generalized_unifrac() function, which now always
+    # requires engine='gpu'.
 
     @numba_code
-    def test_weighted_unifrac_variance_adjust_engine_numba_matches_single_pair(self):
-        # The variance_adjust path of the numba pdist kernel
-        # (_weighted_unifrac_pdist_numba / _weighted_unifrac_pdist_nb) has no
-        # cython/pairwise_func counterpart to compare against, so cross-check
-        # it directly against the single-pair weighted_unifrac path for every
-        # pair in the tiny-test table -- that path is already validated
-        # against the SSU fixtures above, so this transitively confirms the
-        # kernel's variance_adjust branch for every pair, not just the 3 spot
-        # checks used elsewhere in this file. See
-        # test_beta_diversity_weighted_unifrac_variance_adjust below for the
-        # end-to-end beta_diversity coverage of this combination.
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        n = table.shape[0]
-        for normalized in (False, True):
-            condensed = _weighted_unifrac_pdist_numba(
-                table, taxa, tree, normalized=normalized,
-                variance_adjust=True, validate=True,
-            )
-            obs = DistanceMatrix(condensed, sample_ids)
-            for i in range(n):
-                for j in range(i + 1, n):
-                    expected = weighted_unifrac(
-                        table[i], table[j], taxa, tree,
-                        normalized=normalized, variance_adjust=True,
-                    )
-                    self.assertAlmostEqual(
-                        obs[sample_ids[i], sample_ids[j]], expected, places=10,
-                    )
-
     def test_generalized_unifrac_matches_ssu_fixture(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         for alpha, fname in [(0.5, 'generalized_unifrac_alpha0.5_dm.txt'),
                              (1.0, 'generalized_unifrac_alpha1.0_dm.txt')]:
             expected = self._load_dm_fixture(fname)
+            condensed = _generalized_unifrac_pdist_numba(
+                table, taxa, tree, alpha=alpha, validate=True,
+            )
+            obs = DistanceMatrix(condensed, sample_ids)
             for i, j in [(0, 1), (2, 5), (3, 7)]:
-                obs = generalized_unifrac(table[i], table[j], taxa, tree, alpha=alpha)
                 self.assertAlmostEqual(
-                    obs, expected[sample_ids[i], sample_ids[j]],
+                    obs[sample_ids[i], sample_ids[j]],
+                    expected[sample_ids[i], sample_ids[j]],
                     delta=SSU_FIXTURE_TOLERANCE
                 )
 
+    @numba_code
     def test_generalized_unifrac_variance_adjust_matches_ssu_fixture(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         expected = self._load_dm_fixture('generalized_unifrac_alpha1.0_vaw_dm.txt')
+        condensed = _generalized_unifrac_pdist_numba(
+            table, taxa, tree, alpha=1.0, variance_adjust=True, validate=True,
+        )
+        obs = DistanceMatrix(condensed, sample_ids)
         for i, j in [(0, 1), (2, 5), (3, 7)]:
-            obs = generalized_unifrac(
-                table[i], table[j], taxa, tree, alpha=1.0, variance_adjust=True
-            )
             self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]],
+                obs[sample_ids[i], sample_ids[j]],
+                expected[sample_ids[i], sample_ids[j]],
                 delta=SSU_FIXTURE_TOLERANCE
             )
 
-    def test_generalized_unifrac_alpha_out_of_range_raises(self):
-        with self.assertRaises(ValueError):
-            generalized_unifrac(
-                [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1, alpha=1.5
-            )
-
+    @numba_code
     def test_generalized_unifrac_both_empty_is_zero(self):
-        obs = generalized_unifrac(
-            [0, 0, 0], [0, 0, 0], self.oids1[:3], self.t1
+        u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index = (
+            _setup_pairwise_unifrac(
+                [0, 0, 0], [0, 0, 0], self.oids1[:3], self.t1,
+                True, normalized=True, unweighted=False,
+            )
+        )
+        obs = _generalized_unifrac(
+            u_node_counts, v_node_counts, u_total_count, v_total_count,
+            tree_index["length"], 1.0, False,
         )
         self.assertEqual(obs, 0.0)
 
-    @skipIf(NUMBA_AVAILABLE, "numba is installed")
-    def test_generalized_unifrac_requires_numba(self):
-        # Unlike unweighted/weighted_unifrac, generalized_unifrac has no
-        # cython fallback at all, so it must raise even without
-        # variance_adjust=True.
-        with self.assertRaises(ImportError):
+    def test_generalized_unifrac_cpu_raises_not_implemented(self):
+        # generalized_unifrac has no CPU implementation in this release; it
+        # ships GPU-only regardless of numba availability (CPU/numba support
+        # is planned for a future PR).
+        with self.assertRaises(NotImplementedError):
             generalized_unifrac([1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1)
 
-    def test_generalized_unifrac_no_numba_bad_alpha_raises_importerror(self):
-        # Regression test: the numba-availability check must still run (and
-        # raise ImportError) before alpha-range validation on the default
-        # (non-'gpu') engine path, exactly as it did before `engine` was
-        # added. Monkeypatches NUMBA_AVAILABLE=False (rather than relying on
-        # @skipIf like test_generalized_unifrac_requires_numba above) so
-        # this exercises the ordering on a machine where numba IS installed.
-        with patch("skbio.diversity.beta._unifrac.NUMBA_AVAILABLE", False):
-            with self.assertRaises(ImportError):
+    def test_generalized_unifrac_cpu_raises_before_alpha_check(self):
+        # The "requires GPU" check runs before alpha-range validation on the
+        # default (non-'gpu') engine path, mirroring the numba-before-alpha
+        # ordering this replaced (see test_generalized_unifrac_alpha_out_of_
+        # range_raises below for the GPU-available alpha-validation path).
+        with self.assertRaises(NotImplementedError):
+            generalized_unifrac(
+                [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1, alpha=1.5,
+            )
+
+    def test_generalized_unifrac_alpha_out_of_range_raises(self):
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
+            return_value="cuda",
+        ):
+            with self.assertRaises(ValueError):
                 generalized_unifrac(
-                    [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1, alpha=1.5,
+                    [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1,
+                    alpha=1.5, engine='gpu',
                 )
 
-    def test_beta_diversity_gen_unifrac_no_numba_bad_alpha_raises_importerror(self):
+    def test_beta_diversity_generalized_unifrac_cpu_raises_before_alpha_check(self):
         # beta_diversity counterpart of the regression test above.
-        with patch("skbio.diversity._driver.NUMBA_AVAILABLE", False):
-            with self.assertRaises(ImportError):
-                beta_diversity(
-                    "generalized_unifrac", self.b1, ids=self.sids1,
-                    taxa=self.oids1, tree=self.t1, alpha=1.5,
-                )
+        with self.assertRaises(NotImplementedError):
+            beta_diversity(
+                "generalized_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1, alpha=1.5,
+            )
 
     @numba_code
     def test_generalized_unifrac_pdist_numba_matches_single_pair(self):
         # generalized_unifrac has no cython/pairwise_func counterpart to
         # compare the numba pdist kernel against, so cross-check
         # _generalized_unifrac_pdist_numba directly against the single-pair
-        # generalized_unifrac path (already validated against the SSU
+        # _generalized_unifrac path (already validated against the SSU
         # fixtures above) for every pair in the tiny-test table, across both
         # alpha values and with/without variance_adjust.
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -921,9 +847,17 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 obs = DistanceMatrix(condensed, sample_ids)
                 for i in range(n):
                     for j in range(i + 1, n):
-                        expected = generalized_unifrac(
+                        (
+                            u_node_counts, v_node_counts,
+                            u_total_count, v_total_count, tree_index,
+                        ) = _setup_pairwise_unifrac(
                             table[i], table[j], taxa, tree,
-                            alpha=alpha, variance_adjust=variance_adjust,
+                            True, normalized=True, unweighted=False,
+                        )
+                        expected = _generalized_unifrac(
+                            u_node_counts, v_node_counts,
+                            u_total_count, v_total_count,
+                            tree_index["length"], alpha, variance_adjust,
                         )
                         self.assertAlmostEqual(
                             obs[sample_ids[i], sample_ids[j]], expected, places=10,
@@ -1085,40 +1019,39 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         self.assertEqual(dm_nb.shape, (1, 1))
         self.assertEqual(dm_nb.data[0, 0], 0.0)
 
-    def test_beta_diversity_generalized_unifrac(self):
+    def test_beta_diversity_generalized_unifrac_cpu_raises_not_implemented(self):
+        # generalized_unifrac ships GPU-only in this release; see
+        # test_beta_diversity_generalized_unifrac_gpu_engine_raises_without_gpu
+        # below for the (hardware-gated) engine='gpu' coverage.
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        dm = beta_diversity(
-            "generalized_unifrac", table, ids=sample_ids, taxa=taxa, tree=tree,
-            alpha=0.5,
-        )
-        expected = self._load_dm_fixture('generalized_unifrac_alpha0.5_dm.txt')
-        self.assertAlmostEqual(
-            dm['f2', 'f1'], expected['f2', 'f1'], delta=SSU_FIXTURE_TOLERANCE
-        )
-
-    def test_beta_diversity_unweighted_unifrac_variance_adjust(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        dm = beta_diversity(
-            "unweighted_unifrac", table, ids=sample_ids, taxa=taxa, tree=tree,
-            variance_adjust=True,
-        )
-        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
-        self.assertAlmostEqual(
-            dm['f2', 'f1'], expected['f2', 'f1'], delta=SSU_FIXTURE_TOLERANCE)
-
-    def test_beta_diversity_weighted_unifrac_variance_adjust(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        for normalized, fname in [
-            (False, 'weighted_unifrac_vaw_dm.txt'),
-            (True, 'weighted_normalized_unifrac_vaw_dm.txt'),
-        ]:
-            dm = beta_diversity(
-                "weighted_unifrac", table, ids=sample_ids, taxa=taxa, tree=tree,
-                normalized=normalized, variance_adjust=True,
+        with self.assertRaises(NotImplementedError):
+            beta_diversity(
+                "generalized_unifrac", table, ids=sample_ids, taxa=taxa,
+                tree=tree, alpha=0.5,
             )
-            expected = self._load_dm_fixture(fname)
-            self.assertAlmostEqual(
-                dm['f2', 'f1'], expected['f2', 'f1'], delta=SSU_FIXTURE_TOLERANCE)
+
+    def test_beta_diversity_unweighted_unifrac_variance_adjust_cpu_raises_not_implemented(
+        self,
+    ):
+        # variance_adjust is GPU-only for unweighted_unifrac in this release.
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        with self.assertRaises(NotImplementedError):
+            beta_diversity(
+                "unweighted_unifrac", table, ids=sample_ids, taxa=taxa,
+                tree=tree, variance_adjust=True,
+            )
+
+    def test_beta_diversity_weighted_unifrac_variance_adjust_cpu_raises_not_implemented(
+        self,
+    ):
+        # variance_adjust is GPU-only for weighted_unifrac in this release.
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        for normalized in (False, True):
+            with self.assertRaises(NotImplementedError):
+                beta_diversity(
+                    "weighted_unifrac", table, ids=sample_ids, taxa=taxa,
+                    tree=tree, normalized=normalized, variance_adjust=True,
+                )
 
     def test_beta_diversity_engine_invalid(self):
         with self.assertRaisesRegex(
@@ -1227,70 +1160,31 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
 
     # -- beta_diversity kwarg handling ---------------------------------
 
-    @numba_code
-    def test_beta_diversity_unweighted_unifrac_unnormalized(self):
-        # `normalized` must reach the unweighted_unifrac kernels rather than
-        # being dropped (gpu) or treated as an unrecognized kwarg (numba).
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
+    def test_beta_diversity_unweighted_unifrac_unnormalized_cpu_raises_not_implemented(
+        self,
+    ):
+        # normalized=False for unweighted_unifrac is GPU-only in this
+        # release, for every CPU-side engine choice.
         for engine in (None, 'cython', 'numba', 'fast'):
-            dm = beta_diversity(
-                "unweighted_unifrac", table, ids=sample_ids, taxa=taxa,
-                tree=tree, normalized=False, engine=engine)
-            self.assertAlmostEqual(
-                dm['f2', 'f1'], expected['f2', 'f1'],
-                delta=SSU_FIXTURE_TOLERANCE)
+            with self.assertRaises(NotImplementedError):
+                beta_diversity(
+                    "unweighted_unifrac", self.b1, ids=self.sids1,
+                    taxa=self.oids1, tree=self.t1, normalized=False,
+                    engine=engine)
 
-    @numba_code
-    def test_beta_diversity_unweighted_unifrac_unnormalized_uses_numba(self):
-        # normalized is a kwarg the numba kernel supports, so asking for
-        # engine='numba' with it must not warn about falling back.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            beta_diversity(
-                "unweighted_unifrac", self.b1, ids=self.sids1,
-                taxa=self.oids1, tree=self.t1, normalized=False,
-                engine="numba")
-        self.assertEqual(
-            [str(w.message) for w in caught if "engine=" in str(w.message)], [])
-
-    @numba_code
     def test_beta_diversity_variance_adjust_with_pairwise_func_raises(self):
-        # There is no non-numba implementation of variance adjustment, so a
-        # pairwise_func (which forces the generic pdist path) must raise
-        # rather than silently return the plain, non-adjusted result.
+        # variance_adjust has no CPU implementation at all in this release
+        # (GPU-only), so it must raise regardless of pairwise_func.
         def recording_pdist(counts, metric, **kwargs):
             from scipy.spatial.distance import pdist
             return pdist(counts, metric=metric, **kwargs)
 
         for metric in ("unweighted_unifrac", "weighted_unifrac"):
-            with self.assertRaisesRegex(ValueError, "variance_adjust"):
+            with self.assertRaisesRegex(NotImplementedError, "variance_adjust"):
                 beta_diversity(
                     metric, self.b1, ids=self.sids1, taxa=self.oids1,
                     tree=self.t1, variance_adjust=True,
                     pairwise_func=recording_pdist)
-
-    @numba_code
-    def test_beta_diversity_generalized_unifrac_bogus_kwarg_raises(self):
-        # A typo'd alpha used to be silently ignored, computing with the
-        # default alpha instead.
-        with self.assertRaises(TypeError):
-            beta_diversity(
-                "generalized_unifrac", self.b1, ids=self.sids1,
-                taxa=self.oids1, tree=self.t1, alpah=0.5)
-
-    @numba_code
-    def test_beta_diversity_generalized_unifrac_pairwise_func_raises(self):
-        # generalized_unifrac has no pairwise_func path at all, so a supplied
-        # one must raise rather than be silently ignored.
-        def not_a_real_pdist(counts, metric, **kwargs):
-            return np.zeros(counts.shape[0] * (counts.shape[0] - 1) // 2)
-
-        with self.assertRaisesRegex(ValueError, "pairwise_func"):
-            beta_diversity(
-                "generalized_unifrac", self.b1, ids=self.sids1,
-                taxa=self.oids1, tree=self.t1,
-                pairwise_func=not_a_real_pdist)
 
     def test_beta_diversity_gpu_engine_bogus_kwarg_raises(self):
         # Checked before GPU backend detection, so this runs with or without

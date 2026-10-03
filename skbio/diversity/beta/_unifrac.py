@@ -73,12 +73,12 @@ def unweighted_unifrac(
         If ``True`` (default), the unique branch length is normalized by the
         observed branch length, so the result falls in the range
         ``[0.0, 1.0]``. If ``False``, the raw unique branch length is
-        returned.
+        returned. ``False`` is currently only supported with
+        ``engine='gpu'``.
     variance_adjust : bool, optional
         If ``True``, apply variance adjustment, downweighting the contribution
         of branches whose node counts across the two samples have high
-        variance. Requires numba to be installed; raises ``ImportError``
-        otherwise.
+        variance. Currently only supported with ``engine='gpu'``.
     engine : {'gpu'}, optional
         If ``'gpu'``, dispatch to a GPU-accelerated implementation, raising
         ``ImportError`` if no usable GPU backend (``numba-cuda`` or
@@ -105,6 +105,10 @@ def unweighted_unifrac(
         ``'gpu'``. Exact error will depend on what was invalid.
     ImportError
         If ``engine='gpu'`` is requested but no usable GPU backend is found.
+    NotImplementedError
+        If ``normalized=False`` or ``variance_adjust=True`` is requested
+        without ``engine='gpu'``. CPU support for these options is planned
+        for a future release.
 
     See Also
     --------
@@ -218,26 +222,20 @@ def unweighted_unifrac(
             validate=validate,
         )
         return distances[0]
-    if variance_adjust and not NUMBA_AVAILABLE:
-        raise ImportError("variance_adjust=True for unweighted_unifrac requires numba.")
-    (
-        u_node_counts,
-        v_node_counts,
-        u_total_count,
-        v_total_count,
-        tree_index,
-    ) = _setup_pairwise_unifrac(
+    if variance_adjust:
+        raise NotImplementedError(
+            "variance_adjust=True for unweighted_unifrac currently requires "
+            "engine='gpu'. CPU support is planned for a future release."
+        )
+    if not normalized:
+        raise NotImplementedError(
+            "normalized=False for unweighted_unifrac currently requires "
+            "engine='gpu'. CPU support is planned for a future release."
+        )
+    u_node_counts, v_node_counts, _, _, tree_index = _setup_pairwise_unifrac(
         u_counts, v_counts, taxa, tree, validate, normalized=False, unweighted=True
     )
-    return _unweighted_unifrac(
-        u_node_counts,
-        v_node_counts,
-        tree_index["length"],
-        normalized=normalized,
-        variance_adjust=variance_adjust,
-        u_total_count=u_total_count,
-        v_total_count=v_total_count,
-    )
+    return _unweighted_unifrac(u_node_counts, v_node_counts, tree_index["length"])
 
 
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
@@ -271,8 +269,7 @@ def weighted_unifrac(
     variance_adjust : bool, optional
         If ``True``, apply variance adjustment, downweighting the contribution
         of branches whose node counts across the two samples have high
-        variance. Requires numba to be installed; raises ``ImportError``
-        otherwise.
+        variance. Currently only supported with ``engine='gpu'``.
     engine : {'gpu'}, optional
         If ``'gpu'``, dispatch to a GPU-accelerated implementation, raising
         ``ImportError`` if no usable GPU backend (``numba-cuda`` or
@@ -299,6 +296,9 @@ def weighted_unifrac(
         ``'gpu'``. Exact error will depend on what was invalid.
     ImportError
         If ``engine='gpu'`` is requested but no usable GPU backend is found.
+    NotImplementedError
+        If ``variance_adjust=True`` is requested without ``engine='gpu'``.
+        CPU support for this option is planned for a future release.
 
     See Also
     --------
@@ -432,17 +432,9 @@ def weighted_unifrac(
     branch_lengths = tree_index["length"]
 
     if variance_adjust:
-        if not NUMBA_AVAILABLE:
-            raise ImportError(
-                "variance_adjust=True for weighted_unifrac requires numba."
-            )
-        return _weighted_unifrac_vaw(
-            u_node_counts,
-            v_node_counts,
-            u_total_count,
-            v_total_count,
-            branch_lengths,
-            normalized,
+        raise NotImplementedError(
+            "variance_adjust=True for weighted_unifrac currently requires "
+            "engine='gpu'. CPU support is planned for a future release."
         )
     if normalized:
         tip_indices = _get_tip_indices(tree_index)
@@ -478,15 +470,7 @@ def _setup_pairwise_unifrac(
     return (*counts_by_node, *total_counts, tree_index)
 
 
-def _unweighted_unifrac(
-    u_node_counts,
-    v_node_counts,
-    branch_lengths,
-    normalized=True,
-    variance_adjust=False,
-    u_total_count=None,
-    v_total_count=None,
-):
+def _unweighted_unifrac(u_node_counts, v_node_counts, branch_lengths):
     """Calculate unweighted UniFrac distance between samples.
 
     Parameters
@@ -498,17 +482,6 @@ def _unweighted_unifrac(
     branch_lengths : ndarray
         Vector of branch lengths of all nodes (tips and internal nodes) in
         postorder representation of their tree.
-    normalized : bool, optional
-        If ``True`` (default), divide the unique branch length by the
-        observed branch length. If ``False``, return the raw unique branch
-        length.
-    variance_adjust : bool, optional
-        If ``True``, weight each node's branch length by the inverse of the
-        standard deviation of its count across the two samples, as described
-        by the variance-adjusted UniFrac formula.
-    u_total_count, v_total_count : int, optional
-        The scalar sum of all tip counts in samples `u` and `v`,
-        respectively. Required when ``variance_adjust`` is ``True``.
 
     Returns
     -------
@@ -523,23 +496,10 @@ def _unweighted_unifrac(
     """
     unique_nodes = np.logical_xor(u_node_counts, v_node_counts)
     observed_nodes = np.logical_or(u_node_counts, v_node_counts)
-    if variance_adjust:
-        # m is the scalar total tip-count sum per sample (same value used for
-        # every node, matching run_VawUnweightedTask_T's sample_total_counts[k]);
-        # mi varies per node (embedded_counts[offset+k]).
-        m = u_total_count + v_total_count
-        mi = u_node_counts.astype(np.float64) + v_node_counts
-        with np.errstate(invalid="ignore"):
-            vaw = np.sqrt(mi * (m - mi))
-        weight = np.where(vaw > 0, branch_lengths / np.where(vaw > 0, vaw, 1.0), 0.0)
-        unique_branch_length = (weight * unique_nodes).sum()
-        observed_branch_length = (weight * observed_nodes).sum()
-    else:
-        unique_branch_length = (branch_lengths * unique_nodes).sum()
-        observed_branch_length = (branch_lengths * observed_nodes).sum()
-    if not normalized:
-        return unique_branch_length
+    unique_branch_length = (branch_lengths * unique_nodes).sum()
+    observed_branch_length = (branch_lengths * observed_nodes).sum()
     if observed_branch_length == 0.0:
+        # handle special case to avoid division by zero
         return 0.0
     return unique_branch_length / observed_branch_length
 
@@ -644,70 +604,6 @@ def _weighted_unifrac_normalized(
     return u / c
 
 
-def _weighted_unifrac_vaw(
-    u_node_counts,
-    v_node_counts,
-    u_total_count,
-    v_total_count,
-    branch_lengths,
-    normalized,
-):
-    """Calculate variance-adjusted weighted UniFrac distance between samples.
-
-    Parameters
-    ----------
-    u_node_counts, v_node_counts : ndarray
-        Vectors indicating presence (value greater than zero) and absence
-        (value equal to zero) of nodes in two samples, `u` and `v`. Order is
-        assumed to be the same as in `branch_lengths`.
-    u_total_count, v_total_count : int
-        The scalar sum of all tip counts in samples `u` and `v`,
-        respectively.
-    branch_lengths : ndarray
-        Vector of branch lengths of all nodes (tips and internal nodes) in
-        postorder representation of their tree.
-    normalized : bool
-        If ``True``, divide the numerator by the variance-adjusted branch
-        length correction. If ``False``, return the raw numerator.
-
-    Returns
-    -------
-    float
-        Variance-adjusted weighted UniFrac distance between samples.
-
-    Notes
-    -----
-    The count vectors passed here correspond to all nodes in the tree, not
-    just the tips. Unlike the plain weighted UniFrac formula, this sums
-    directly over every node using the raw ``branch_lengths`` -- the
-    tip-shortcut optimization used by ``_weighted_unifrac_normalized`` does
-    not generalize to the variance-adjusted term, which is nonlinear in the
-    node proportions.
-
-    """
-    m = u_total_count + v_total_count
-    mi = u_node_counts.astype(np.float64) + v_node_counts
-    with np.errstate(invalid="ignore"):
-        vaw = np.sqrt(mi * (m - mi))
-    mask = vaw > 0
-    safe_vaw = np.where(mask, vaw, 1.0)
-    if u_total_count > 0:
-        up = u_node_counts / u_total_count
-    else:
-        up = u_node_counts.astype(np.float64)
-    if v_total_count > 0:
-        vp = v_node_counts / v_total_count
-    else:
-        vp = v_node_counts.astype(np.float64)
-    numerator = np.where(mask, branch_lengths * np.abs(up - vp) / safe_vaw, 0.0).sum()
-    if not normalized:
-        return numerator
-    denominator = np.where(mask, branch_lengths * (up + vp) / safe_vaw, 0.0).sum()
-    if denominator == 0.0:
-        return 0.0
-    return numerator / denominator
-
-
 def _setup_multiple_unifrac(counts, taxa, tree, validate):
     if validate:
         _validate_taxa_and_tree(taxa, tree, rooted=True, lengths=True)
@@ -719,7 +615,7 @@ def _setup_multiple_unifrac(counts, taxa, tree, validate):
     return counts_by_node, tree_index, branch_lengths
 
 
-def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate, normalized=True):
+def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate):
     r"""Create optimized pdist-compatible unweighted UniFrac function.
 
     Parameters
@@ -736,9 +632,6 @@ def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate, normalized=
         of ``taxa``, but not a subset.
     validate: bool, optional
         If ``False``, validation of the input won't be performed.
-    normalized : bool, optional
-        If ``True`` (default), divide the unique branch length by the observed
-        branch length.
 
     Returns
     -------
@@ -753,9 +646,7 @@ def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate, normalized=
         counts, taxa, tree, validate
     )
 
-    f = partial(
-        _unweighted_unifrac, branch_lengths=branch_lengths, normalized=normalized
-    )
+    f = partial(_unweighted_unifrac, branch_lengths=branch_lengths)
 
     return f, counts_by_node
 
@@ -769,15 +660,7 @@ if NUMBA_AVAILABLE:
 
     @njit(inline="always")
     def _unweighted_unifrac_row_nb(
-        row,
-        n_samples,
-        n_nodes,
-        counts_by_node,
-        branch_lengths,
-        sample_totals,
-        normalized,
-        variance_adjust,
-        out,
+        row, n_samples, n_nodes, counts_by_node, branch_lengths, out
     ):
         """Fill out[] with row's distance to every sample j > row.
 
@@ -787,43 +670,28 @@ if NUMBA_AVAILABLE:
         code as writing it out twice.
         """
         base = _condensed_row_base(row, n_samples)
+        present_row = np.empty(n_nodes, np.bool_)
+        for k in range(n_nodes):
+            present_row[k] = counts_by_node[row, k] > 0
         for j in range(row + 1, n_samples):
             unique = 0.0
             observed = 0.0
             for k in range(n_nodes):
-                u_count = counts_by_node[row, k]
-                v_count = counts_by_node[j, k]
-                u_present = u_count > 0
-                v_present = v_count > 0
-                if not (u_present or v_present):
-                    continue
-                bl = branch_lengths[k]
-                if variance_adjust:
-                    m = sample_totals[row] + sample_totals[j]
-                    mi = u_count + v_count
-                    vaw = np.sqrt(mi * (m - mi))
-                    if vaw <= 0.0:
-                        continue
-                    bl = bl / vaw
-                observed += bl
-                if u_present != v_present:
-                    unique += bl
+                u_present = present_row[k]
+                v_present = counts_by_node[j, k] > 0
+                if u_present or v_present:
+                    bl = branch_lengths[k]
+                    observed += bl
+                    if u_present != v_present:
+                        unique += bl
             idx = base + j
-            if not normalized:
-                out[idx] = unique
-            elif observed == 0.0:
+            if observed == 0.0:
                 out[idx] = 0.0
             else:
                 out[idx] = unique / observed
 
     @njit(parallel=True)
-    def _unweighted_unifrac_pdist_nb(
-        counts_by_node,
-        branch_lengths,
-        sample_totals,
-        normalized,
-        variance_adjust,
-    ):
+    def _unweighted_unifrac_pdist_nb(counts_by_node, branch_lengths):
         """Full unweighted UniFrac distance matrix (condensed) via Numba.
 
         Computes the condensed pairwise unweighted UniFrac distance vector in a
@@ -834,14 +702,8 @@ if NUMBA_AVAILABLE:
 
         Reproduces exactly the reference algorithm in ``_unweighted_unifrac``:
         for each pair, sum branch lengths of nodes present in exactly one sample
-        (``unique``) and of nodes present in either sample (``observed``); when
-        ``normalized`` is ``True`` the distance is ``unique / observed`` (or
-        ``0.0`` when ``observed == 0``), otherwise the raw ``unique`` length is
-        returned. When ``variance_adjust`` is ``True``, each node's branch
-        length is additionally divided by ``sqrt(mi * (m - mi))``, where ``m``
-        is the scalar sum of the two samples' tip-count totals and ``mi`` is
-        the per-node sum of the two samples' counts at that node; nodes where
-        that quantity is non-positive contribute zero.
+        (``unique``) and of nodes present in either sample (``observed``); the
+        distance is ``unique / observed``, or ``0.0`` when ``observed == 0``.
 
         Sample ``i``'s node-presence row is computed once per ``i`` (outside the
         ``j`` loop) rather than recomputed for every ``j``, since it doesn't
@@ -856,14 +718,6 @@ if NUMBA_AVAILABLE:
             presence (> 0) is used. Integer dtype.
         branch_lengths : np.ndarray of shape (n_nodes,), float64
             Branch length of each node, postorder.
-        sample_totals : np.ndarray of shape (n_samples,), float64
-            Per-sample sum of tip counts. Only used when ``variance_adjust``
-            is ``True``.
-        normalized : bool
-            Whether to divide the unique branch length by the observed branch
-            length.
-        variance_adjust : bool
-            Whether to apply variance adjustment.
 
         Returns
         -------
@@ -889,56 +743,30 @@ if NUMBA_AVAILABLE:
         # _permanova_f_stat_sW_condensed_nb already makes.
         for i in prange(n_half):
             _unweighted_unifrac_row_nb(
-                i,
-                n_samples,
-                n_nodes,
-                counts_by_node,
-                branch_lengths,
-                sample_totals,
-                normalized,
-                variance_adjust,
-                out,
+                i, n_samples, n_nodes, counts_by_node, branch_lengths, out
             )
             mirror_i = n_samples - i - 2
             if mirror_i != i:
                 _unweighted_unifrac_row_nb(
-                    mirror_i,
-                    n_samples,
-                    n_nodes,
-                    counts_by_node,
-                    branch_lengths,
-                    sample_totals,
-                    normalized,
-                    variance_adjust,
-                    out,
+                    mirror_i, n_samples, n_nodes, counts_by_node, branch_lengths, out
                 )
 
         return out
 
 
-def _unweighted_unifrac_pdist_numba(
-    counts,
-    taxa,
-    tree,
-    *,
-    normalized=True,
-    variance_adjust=False,
-    validate=True,
-):
+def _unweighted_unifrac_pdist_numba(counts, taxa, tree, *, validate=True):
     """Compute the condensed unweighted UniFrac distance vector (Numba engine).
 
-    Builds the per-node counts, branch lengths, and (when ``variance_adjust``
-    is ``True``) per-sample tip-count totals (reusing
-    ``_setup_multiple_unifrac`` and ``_get_tip_indices``), then dispatches to
-    the parallel Numba kernel. Returns a condensed distance vector consumable
-    by ``DistanceMatrix``.
+    Builds the per-node counts and branch lengths (reusing
+    ``_setup_multiple_unifrac``) and dispatches to the parallel Numba kernel.
+    Returns a condensed distance vector consumable by ``DistanceMatrix``.
 
-    Everything after ``tree`` is keyword-only: the three ``*_pdist_numba``
-    kernels take different options, and passing them positionally made the
-    orders easy to confuse.
+    ``validate`` is keyword-only: the three ``*_pdist_numba`` kernels take
+    different options, and passing them positionally made the orders easy to
+    confuse.
 
     """
-    counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
+    counts_by_node, _, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
     )
     # counts_by_node is a transposed view (see _setup_multiple_unifrac) and so
@@ -946,18 +774,7 @@ def _unweighted_unifrac_pdist_numba(
     # ascontiguousarray pays that cost once here instead of on every strided
     # read inside the O(n_samples^2 * n_nodes) kernel.
     counts_by_node = np.ascontiguousarray(counts_by_node)
-    if variance_adjust:
-        tip_indices = _get_tip_indices(tree_index)
-        sample_totals = counts_by_node[:, tip_indices].sum(axis=1, dtype=np.float64)
-    else:
-        sample_totals = np.zeros(0, dtype=np.float64)
-    return _unweighted_unifrac_pdist_nb(
-        counts_by_node,
-        branch_lengths,
-        sample_totals,
-        normalized,
-        variance_adjust,
-    )
+    return _unweighted_unifrac_pdist_nb(counts_by_node, branch_lengths)
 
 
 if NUMBA_AVAILABLE:
@@ -972,7 +789,6 @@ if NUMBA_AVAILABLE:
         sample_totals,
         node_to_root_distances,
         normalized,
-        variance_adjust,
         out,
     ):
         """Fill out[] with row's distance to every sample j > row.
@@ -993,10 +809,6 @@ if NUMBA_AVAILABLE:
                 row_proportions[k] = 0.0
         for j in range(row + 1, n_samples):
             v_total = sample_totals[j]
-            # Scalar per-pair total, shared by every node's VAW term below --
-            # NOT a per-node quantity (that bug class has bitten this plan
-            # twice already).
-            m = row_total + v_total
             wu = 0.0
             c = 0.0
             for k in range(n_nodes):
@@ -1005,25 +817,12 @@ if NUMBA_AVAILABLE:
                     vp = counts_by_node[j, k] / v_total
                 else:
                     vp = 0.0
-                if variance_adjust:
-                    mi = counts_by_node[row, k] + counts_by_node[j, k]
-                    vaw = np.sqrt(mi * (m - mi))
-                    if vaw <= 0.0:
-                        continue
-                    bl = branch_lengths[k] / vaw
-                else:
-                    bl = branch_lengths[k]
-                wu += bl * abs(up - vp)
+                wu += branch_lengths[k] * abs(up - vp)
                 if normalized:
-                    if variance_adjust:
-                        c += bl * (up + vp)
-                    else:
-                        c += node_to_root_distances[k] * (up + vp)
+                    c += node_to_root_distances[k] * (up + vp)
             idx = base + j
             if normalized:
-                if variance_adjust:
-                    out[idx] = 0.0 if c == 0.0 else wu / c
-                elif row_total == 0.0 and v_total == 0.0:
+                if row_total == 0.0 and v_total == 0.0:
                     out[idx] = 0.0
                 else:
                     out[idx] = wu / c
@@ -1037,7 +836,6 @@ if NUMBA_AVAILABLE:
         sample_totals,
         node_to_root_distances,
         normalized,
-        variance_adjust,
     ):
         """Full weighted UniFrac distance matrix (condensed) via Numba.
 
@@ -1054,15 +852,7 @@ if NUMBA_AVAILABLE:
         weighted by the absolute difference of proportions. When ``normalized``
         is ``True``, the distance is additionally divided by the branch length
         correction ``sum(node_to_root_distances * (up + vp))``, except when both
-        samples are entirely empty, in which case the distance is ``0.0``. When
-        ``variance_adjust`` is ``True``, each node's branch length is instead
-        divided by ``sqrt(mi * (m - mi))`` (``m`` the scalar sum of the two
-        samples' tip-count totals, ``mi`` the per-node sum of the two samples'
-        counts), nodes where that quantity is non-positive contribute zero to
-        both the numerator and (when normalized) the denominator -- which uses
-        the same variance-adjusted branch lengths rather than
-        ``node_to_root_distances``, matching ``_weighted_unifrac_vaw`` -- and
-        the result is ``0.0`` when that denominator is ``0.0``.
+        samples are entirely empty, in which case the distance is ``0.0``.
 
         Sample ``i``'s node proportions depend only on ``i`` (not ``j``), so
         they're computed once per ``i`` outside the ``j`` loop rather than
@@ -1082,8 +872,6 @@ if NUMBA_AVAILABLE:
             ``True``. May be a length-0 placeholder otherwise.
         normalized : bool
             Whether to apply the branch length normalization.
-        variance_adjust : bool
-            Whether to apply variance adjustment.
 
         Returns
         -------
@@ -1112,7 +900,6 @@ if NUMBA_AVAILABLE:
                 sample_totals,
                 node_to_root_distances,
                 normalized,
-                variance_adjust,
                 out,
             )
             mirror_i = n_samples - i - 2
@@ -1126,7 +913,6 @@ if NUMBA_AVAILABLE:
                     sample_totals,
                     node_to_root_distances,
                     normalized,
-                    variance_adjust,
                     out,
                 )
 
@@ -1139,7 +925,6 @@ def _weighted_unifrac_pdist_numba(
     tree,
     *,
     normalized=_normalize_weighted_unifrac_by_default,
-    variance_adjust=False,
     validate=True,
 ):
     """Compute the condensed weighted UniFrac distance vector (Numba engine).
@@ -1164,11 +949,7 @@ def _weighted_unifrac_pdist_numba(
     counts_by_node = np.ascontiguousarray(counts_by_node)
     tip_indices = _get_tip_indices(tree_index)
     sample_totals = counts_by_node[:, tip_indices].sum(axis=1, dtype=np.float64)
-    # node_to_root_distances is only used by the plain (non-VAW) normalized
-    # branch of the kernel; variance_adjust uses branch_lengths / vaw instead
-    # (the tip-shortcut it implements does not generalize to the nonlinear
-    # VAW term), so skip computing it when variance_adjust is set.
-    if normalized and not variance_adjust:
+    if normalized:
         node_to_root_distances = _tip_distances(
             branch_lengths, tree, tip_indices
         ).ravel()
@@ -1180,7 +961,6 @@ def _weighted_unifrac_pdist_numba(
         sample_totals,
         node_to_root_distances,
         normalized,
-        variance_adjust,
     )
 
 
@@ -1285,6 +1065,16 @@ def _weighted_unifrac_branch_correction(
     ).sum()
 
 
+# The CPU/Numba implementation of generalized UniFrac below (_generalized_
+# unifrac, the *_nb kernels and _generalized_unifrac_pdist_numba) is not
+# reachable from the public generalized_unifrac() function or from
+# beta_diversity -- this release ships generalized_unifrac as GPU-only (see
+# generalized_unifrac's NotImplementedError for the CPU path). It is kept
+# here, unexported, as the reference a future PR can wire up CPU support
+# from, and so the existing kernel-level and GPU-vs-CPU cross-validation
+# tests can keep exercising it directly.
+
+
 def _generalized_unifrac(
     u_node_counts,
     v_node_counts,
@@ -1362,10 +1152,10 @@ def generalized_unifrac(
     variance_adjust : bool, optional
         If ``True``, apply variance adjustment (VAW-UniFrac).
     engine : {'gpu'}, optional
-        If ``'gpu'``, dispatch to a GPU-accelerated implementation, raising
-        ``ImportError`` if no usable GPU backend (``numba-cuda`` or
-        ``numba.hip``) is detected. If ``None`` (default), requires numba
-        to be installed (this function has no cython path).
+        generalized_unifrac currently requires a GPU. If ``'gpu'``, dispatch
+        to a GPU-accelerated implementation, raising ``ImportError`` if no
+        usable GPU backend (``numba-cuda`` or ``numba.hip``) is detected. CPU
+        support (``engine=None``) is planned for a future release.
     validate : bool, optional
         If ``False``, skip input validation.
 
@@ -1376,9 +1166,11 @@ def generalized_unifrac(
 
     Raises
     ------
+    NotImplementedError
+        If ``engine`` is not ``'gpu'``. CPU support for generalized_unifrac
+        is planned for a future release.
     ImportError
-        If numba is not installed (this function has no cython path), or if
-        ``engine='gpu'`` is requested but no usable GPU backend is found.
+        If ``engine='gpu'`` is requested but no usable GPU backend is found.
     ValueError
         If ``alpha`` is outside ``[0, 1]``, or if ``engine`` is neither
         ``None`` nor ``'gpu'``.
@@ -1391,61 +1183,36 @@ def generalized_unifrac(
 
     """
     _validate_unifrac_engine(engine)
-    if engine == "gpu":
-        from skbio.diversity.beta._unifrac_gpu import (
-            detect_gpu_backend,
-            generalized_unifrac_gpu,
+    if engine != "gpu":
+        raise NotImplementedError(
+            "generalized_unifrac currently requires a GPU (engine='gpu'); "
+            "CPU support is planned for a future release."
         )
+    from skbio.diversity.beta._unifrac_gpu import (
+        detect_gpu_backend,
+        generalized_unifrac_gpu,
+    )
 
-        if detect_gpu_backend() is None:
-            raise ImportError(
-                "engine='gpu' was requested but no usable GPU backend "
-                "(numba-cuda or numba.hip) was found."
-            )
-    elif not NUMBA_AVAILABLE:
-        raise ImportError("generalized_unifrac requires numba.")
+    if detect_gpu_backend() is None:
+        raise ImportError(
+            "engine='gpu' was requested but no usable GPU backend "
+            "(numba-cuda or numba.hip) was found."
+        )
     if not (0.0 <= alpha <= 1.0):
         raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
-    if engine == "gpu":
-        # Single-pair GPU dispatch is wasteful (kernel launch overhead for
-        # one pair); route through the same GPU pdist driver beta_diversity
-        # uses, with a 2-row input.
-        counts = np.vstack([u_counts, v_counts])
-        distances = generalized_unifrac_gpu(
-            counts,
-            taxa,
-            tree,
-            alpha=alpha,
-            variance_adjust=variance_adjust,
-            validate=validate,
-        )
-        return distances[0]
-    (
-        u_node_counts,
-        v_node_counts,
-        u_total_count,
-        v_total_count,
-        tree_index,
-    ) = _setup_pairwise_unifrac(
-        u_counts,
-        v_counts,
+    # Single-pair GPU dispatch is wasteful (kernel launch overhead for one
+    # pair); route through the same GPU pdist driver beta_diversity uses,
+    # with a 2-row input.
+    counts = np.vstack([u_counts, v_counts])
+    distances = generalized_unifrac_gpu(
+        counts,
         taxa,
         tree,
-        validate,
-        normalized=True,
-        unweighted=False,
+        alpha=alpha,
+        variance_adjust=variance_adjust,
+        validate=validate,
     )
-    if u_total_count == 0.0 and v_total_count == 0.0:
-        return 0.0
-    return _generalized_unifrac(
-        u_node_counts,
-        v_node_counts,
-        u_total_count,
-        v_total_count,
-        tree_index["length"],
-        alpha,
-        variance_adjust,
-    )
+    return distances[0]
 
 
 if NUMBA_AVAILABLE:

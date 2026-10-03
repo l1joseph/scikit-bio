@@ -10,6 +10,7 @@ from unittest import TestCase, main
 
 import numpy as np
 
+from skbio import DistanceMatrix
 from skbio.diversity.beta._unifrac_gpu import (
     _KERNEL_CACHE,
     _build_pair_index,
@@ -29,6 +30,16 @@ from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
 # docs/superpowers/specs/2026-10-02-ssu-unifrac-numba-phase1-design.md.
 # 1e-10 gives a huge (~3e5x) safety margin.
 GPU_CPU_TOLERANCE = 1e-10
+
+# unweighted_unifrac's normalized=False and variance_adjust=True, and
+# weighted_unifrac's variance_adjust=True, are GPU-only in this release (the
+# corresponding CPU/numba kernel support was reverted; see CHANGELOG.md), so
+# those combinations are checked against the qiime-191-tt SSU-fixture
+# distance matrices directly instead of against the CPU numba kernel.
+# Measured max abs deviation, GPU vs ssu-ascii-fixture, is far looser than
+# the GPU-vs-CPU-numba figure above; see test_unifrac.py's
+# SSU_FIXTURE_TOLERANCE for the same figure used on the CPU side.
+GPU_FIXTURE_TOLERANCE = 1.5e-6
 
 
 class GpuBackendTests(TestCase):
@@ -137,86 +148,99 @@ class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         )
         np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
-    def test_weighted_unifrac_gpu_matches_cpu_variance_adjusted_unnormalized(self):
-        from skbio.diversity.beta._unifrac import _weighted_unifrac_pdist_numba
-        table, taxa, tree, _ = self._load_qiime_191_tt()
+    def test_weighted_unifrac_gpu_matches_fixture_variance_adjusted_unnormalized(self):
+        # weighted_unifrac's variance_adjust is GPU-only in this release (the
+        # CPU/numba kernel's variance_adjust support was reverted; see
+        # CHANGELOG.md), so this checks the GPU result against the
+        # qiime-191-tt SSU fixture directly rather than against the CPU
+        # kernel.
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         gpu = weighted_unifrac_gpu(
             table, taxa, tree,
             normalized=False, variance_adjust=True, validate=True,
         )
-        cpu = _weighted_unifrac_pdist_numba(
-            table, taxa, tree,
-            normalized=False, variance_adjust=True, validate=True,
-        )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+        obs = DistanceMatrix(gpu, sample_ids)
+        expected = self._load_dm_fixture('weighted_unifrac_vaw_dm.txt')
+        np.testing.assert_allclose(
+            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
+            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
 
-    def test_weighted_unifrac_gpu_matches_cpu_variance_adjusted_normalized(self):
-        from skbio.diversity.beta._unifrac import _weighted_unifrac_pdist_numba
-        table, taxa, tree, _ = self._load_qiime_191_tt()
+    def test_weighted_unifrac_gpu_matches_fixture_variance_adjusted_normalized(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         gpu = weighted_unifrac_gpu(
             table, taxa, tree,
             normalized=True, variance_adjust=True, validate=True,
         )
-        cpu = _weighted_unifrac_pdist_numba(
-            table, taxa, tree,
-            normalized=True, variance_adjust=True, validate=True,
-        )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+        obs = DistanceMatrix(gpu, sample_ids)
+        expected = self._load_dm_fixture('weighted_normalized_unifrac_vaw_dm.txt')
+        np.testing.assert_allclose(
+            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
+            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
 
 
 class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
+    # unweighted_unifrac's normalized and variance_adjust kwargs are GPU-only
+    # in this release (the CPU/numba kernel was reverted to its pre-PR,
+    # always-normalized, no-variance_adjust behavior; see CHANGELOG.md), so
+    # all four combinations here are checked against the qiime-191-tt SSU
+    # fixture distance matrices directly rather than against the CPU kernel.
 
     def setUp(self):
         if detect_gpu_backend() is None:
             self.skipTest("no GPU backend available")
 
-    def test_unweighted_unifrac_gpu_matches_cpu_unnormalized(self):
-        from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
-        table, taxa, tree, _ = self._load_qiime_191_tt()
+    def test_unweighted_unifrac_gpu_matches_fixture_unnormalized(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         gpu = unweighted_unifrac_gpu(
             table, taxa, tree,
             normalized=False, variance_adjust=False, validate=True,
         )
-        cpu = _unweighted_unifrac_pdist_numba(
-            table, taxa, tree, normalized=False, variance_adjust=False, validate=True
-        )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+        obs = DistanceMatrix(gpu, sample_ids)
+        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
+        np.testing.assert_allclose(
+            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
+            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
 
-    def test_unweighted_unifrac_gpu_matches_cpu_normalized(self):
-        from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
-        table, taxa, tree, _ = self._load_qiime_191_tt()
+    def test_unweighted_unifrac_gpu_matches_fixture_normalized(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         gpu = unweighted_unifrac_gpu(
             table, taxa, tree,
             normalized=True, variance_adjust=False, validate=True,
         )
-        cpu = _unweighted_unifrac_pdist_numba(
-            table, taxa, tree, normalized=True, variance_adjust=False, validate=True
-        )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+        obs = DistanceMatrix(gpu, sample_ids)
+        expected = self._load_dm_fixture('unweighted_unifrac_dm.txt')
+        np.testing.assert_allclose(
+            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
+            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
 
-    def test_unweighted_unifrac_gpu_matches_cpu_variance_adjusted_unnormalized(self):
-        from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
-        table, taxa, tree, _ = self._load_qiime_191_tt()
+    def test_unweighted_unifrac_gpu_matches_fixture_variance_adjusted_unnormalized(
+        self,
+    ):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         gpu = unweighted_unifrac_gpu(
             table, taxa, tree,
             normalized=False, variance_adjust=True, validate=True,
         )
-        cpu = _unweighted_unifrac_pdist_numba(
-            table, taxa, tree, normalized=False, variance_adjust=True, validate=True
-        )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+        obs = DistanceMatrix(gpu, sample_ids)
+        expected = self._load_dm_fixture(
+            'unweighted_unnormalized_unifrac_vaw_dm.txt')
+        np.testing.assert_allclose(
+            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
+            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
 
-    def test_unweighted_unifrac_gpu_matches_cpu_variance_adjusted_normalized(self):
-        from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
-        table, taxa, tree, _ = self._load_qiime_191_tt()
+    def test_unweighted_unifrac_gpu_matches_fixture_variance_adjusted_normalized(
+        self,
+    ):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         gpu = unweighted_unifrac_gpu(
             table, taxa, tree,
             normalized=True, variance_adjust=True, validate=True,
         )
-        cpu = _unweighted_unifrac_pdist_numba(
-            table, taxa, tree, normalized=True, variance_adjust=True, validate=True
-        )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+        obs = DistanceMatrix(gpu, sample_ids)
+        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
+        np.testing.assert_allclose(
+            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
+            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
 
 
 class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):

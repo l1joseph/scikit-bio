@@ -4,10 +4,9 @@
 
 ### Features
 
-* Added `generalized_unifrac` (GUniFrac) to `skbio.diversity.beta`, with an `alpha` parameter controlling the weight given to abundant lineages.
-* Added `normalized` to `unweighted_unifrac`, which when set to `False` returns the raw unique branch length instead of dividing it by the observed branch length.
-* Added `variance_adjust` to `unweighted_unifrac` and `weighted_unifrac`, downweighting branches whose node counts across the two samples have high variance.
+* Added `generalized_unifrac` (GUniFrac) to `skbio.diversity.beta`, with an `alpha` parameter controlling the weight given to abundant lineages. Currently requires `engine='gpu'`; CPU/Numba support is planned for a future release.
 * Added `engine='gpu'` to `unweighted_unifrac`, `weighted_unifrac`, `generalized_unifrac` and `beta_diversity`, dispatching to a GPU-agnostic Numba kernel backed by `numba-cuda` on NVIDIA or `numba.hip` on AMD devices.
+* Added `normalized=False` and `variance_adjust` to `unweighted_unifrac`, and `variance_adjust` to `weighted_unifrac`, downweighting branches whose node counts across the two samples have high variance. Both are currently only supported with `engine='gpu'`; CPU/Numba support is planned for a future release.
 * Added an optional `gpu-nvidia` extra for installing the NVIDIA GPU backend (`numba-cuda`). AMD support requires `numba-hip`, which is published only on test.pypi and must be pinned to match the installed ROCm version, so it has no extra and must be installed manually.
 
 ### Backward-incompatible changes
