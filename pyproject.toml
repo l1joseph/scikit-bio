@@ -78,6 +78,8 @@ lint = [
     "ruff",
     "pre-commit"
 ]
+gpu-nvidia = ["numba-cuda"]
+gpu-amd = ["hip-python"]
 dev = [
     "pytest",
     "coverage",
