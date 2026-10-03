@@ -163,7 +163,7 @@ def _make_unifrac_kernel(cuda):
 
 
 def weighted_unifrac_gpu(
-    counts, taxa, tree, normalized, variance_adjust, validate=True
+    counts, taxa, tree, normalized, variance_adjust=False, validate=True
 ):
     """Compute the condensed weighted UniFrac distance vector on a GPU.
 
