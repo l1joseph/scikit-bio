@@ -1126,6 +1126,81 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                     taxa=self.oids1, tree=self.t1, engine=engine,
                     bogus_kwarg=True)
 
+    # -- engine='gpu' wiring -------------------------------------------
+    #
+    # This machine has no GPU backend, so these only exercise the
+    # no-backend-detected error path. GPU-available correctness coverage
+    # for the underlying *_gpu drivers lives in test_unifrac_gpu.py.
+
+    def test_unweighted_unifrac_gpu_engine_raises_without_gpu(self):
+        from skbio.diversity.beta._unifrac_gpu import detect_gpu_backend
+        if detect_gpu_backend() is not None:
+            self.skipTest(
+                "a GPU backend is available, this test checks the "
+                "no-GPU error path")
+        with self.assertRaises(ImportError):
+            unweighted_unifrac(
+                self.b1[0], self.b1[1], self.oids1, self.t1, engine='gpu')
+
+    def test_weighted_unifrac_gpu_engine_raises_without_gpu(self):
+        from skbio.diversity.beta._unifrac_gpu import detect_gpu_backend
+        if detect_gpu_backend() is not None:
+            self.skipTest(
+                "a GPU backend is available, this test checks the "
+                "no-GPU error path")
+        with self.assertRaises(ImportError):
+            weighted_unifrac(
+                self.b1[0], self.b1[1], self.oids1, self.t1, engine='gpu')
+
+    def test_generalized_unifrac_gpu_engine_raises_without_gpu(self):
+        from skbio.diversity.beta._unifrac_gpu import detect_gpu_backend
+        if detect_gpu_backend() is not None:
+            self.skipTest(
+                "a GPU backend is available, this test checks the "
+                "no-GPU error path")
+        with self.assertRaises(ImportError):
+            generalized_unifrac(
+                self.b1[0], self.b1[1], self.oids1, self.t1, engine='gpu')
+
+    def test_beta_diversity_unweighted_unifrac_gpu_engine_raises_without_gpu(
+        self,
+    ):
+        from skbio.diversity.beta._unifrac_gpu import detect_gpu_backend
+        if detect_gpu_backend() is not None:
+            self.skipTest(
+                "a GPU backend is available, this test checks the "
+                "no-GPU error path")
+        with self.assertRaises(ImportError):
+            beta_diversity(
+                "unweighted_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1, engine="gpu")
+
+    def test_beta_diversity_weighted_unifrac_gpu_engine_raises_without_gpu(
+        self,
+    ):
+        from skbio.diversity.beta._unifrac_gpu import detect_gpu_backend
+        if detect_gpu_backend() is not None:
+            self.skipTest(
+                "a GPU backend is available, this test checks the "
+                "no-GPU error path")
+        with self.assertRaises(ImportError):
+            beta_diversity(
+                "weighted_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1, engine="gpu")
+
+    def test_beta_diversity_generalized_unifrac_gpu_engine_raises_without_gpu(
+        self,
+    ):
+        from skbio.diversity.beta._unifrac_gpu import detect_gpu_backend
+        if detect_gpu_backend() is not None:
+            self.skipTest(
+                "a GPU backend is available, this test checks the "
+                "no-GPU error path")
+        with self.assertRaises(ImportError):
+            beta_diversity(
+                "generalized_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1, engine="gpu")
+
 
 if __name__ == '__main__':
     main()

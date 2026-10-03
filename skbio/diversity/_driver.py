@@ -298,11 +298,15 @@ def beta_diversity(
         Examples of functions that can be provided are SciPy's
         :func:`~scipy.spatial.distance.pdist` (default) and scikit-learn's
         :func:`~sklearn.metrics.pairwise_distances`.
-    engine : {'cython', 'numba', 'fast'}, optional
-        Compute engine for 'unweighted_unifrac' and 'weighted_unifrac'. Ignored for
-        other metrics. If None (default), use the global ``compute_engine`` setting.
-        'fast' selects Numba if installed, otherwise Cython. See :ref:`compute_engines`
-        for details.
+    engine : {'cython', 'numba', 'fast', 'gpu'}, optional
+        Compute engine for 'unweighted_unifrac', 'weighted_unifrac' and
+        'generalized_unifrac'. Ignored for other metrics. If None (default),
+        use the global ``compute_engine`` setting. 'fast' selects Numba if
+        installed, otherwise Cython. 'gpu' dispatches to a GPU-accelerated
+        implementation, raising ``ImportError`` if no usable GPU backend
+        (``numba-cuda`` or ``numba.hip``) is detected; unlike 'fast', 'gpu'
+        is never selected automatically. See :ref:`compute_engines` for
+        details.
 
         .. versionadded:: 0.7.4
     kwargs : dict, optional
@@ -355,6 +359,20 @@ def beta_diversity(
 
     if metric == "unweighted_unifrac":
         variance_adjust = kwargs.pop("variance_adjust", False)
+        if engine == "gpu":
+            from skbio.diversity.beta._unifrac_gpu import (
+                detect_gpu_backend, unweighted_unifrac_gpu,
+            )
+            if detect_gpu_backend() is None:
+                raise ImportError(
+                    "engine='gpu' was requested but no usable GPU backend "
+                    "(numba-cuda or numba.hip) was found."
+                )
+            distances = unweighted_unifrac_gpu(
+                counts, taxa, tree, normalized=True,
+                variance_adjust=variance_adjust, validate=validate,
+            )
+            return DistanceMatrix(distances, ids)
         resolved_engine = _resolve_engine(
             engine, ("cython", "numba"), fast=_UNIFRAC_FAST_ENGINE
         )
@@ -383,6 +401,20 @@ def beta_diversity(
         # back to the default value inside of _weighted_unifrac_pdist_f
         normalized = kwargs.pop("normalized", _normalize_weighted_unifrac_by_default)
         variance_adjust = kwargs.pop("variance_adjust", False)
+        if engine == "gpu":
+            from skbio.diversity.beta._unifrac_gpu import (
+                detect_gpu_backend, weighted_unifrac_gpu,
+            )
+            if detect_gpu_backend() is None:
+                raise ImportError(
+                    "engine='gpu' was requested but no usable GPU backend "
+                    "(numba-cuda or numba.hip) was found."
+                )
+            distances = weighted_unifrac_gpu(
+                counts, taxa, tree, normalized=normalized,
+                variance_adjust=variance_adjust, validate=validate,
+            )
+            return DistanceMatrix(distances, ids)
         resolved_engine = _resolve_engine(
             engine, ("cython", "numba"), fast=_UNIFRAC_FAST_ENGINE
         )
@@ -411,12 +443,26 @@ def beta_diversity(
             counts, taxa=taxa, tree=tree, normalized=normalized, validate=validate
         )
     elif metric == "generalized_unifrac":
-        if not NUMBA_AVAILABLE:
-            raise ImportError("generalized_unifrac requires numba.")
         alpha = kwargs.pop("alpha", 1.0)
         variance_adjust = kwargs.pop("variance_adjust", False)
         if not (0.0 <= alpha <= 1.0):
             raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+        if engine == "gpu":
+            from skbio.diversity.beta._unifrac_gpu import (
+                detect_gpu_backend, generalized_unifrac_gpu,
+            )
+            if detect_gpu_backend() is None:
+                raise ImportError(
+                    "engine='gpu' was requested but no usable GPU backend "
+                    "(numba-cuda or numba.hip) was found."
+                )
+            distances = generalized_unifrac_gpu(
+                counts, taxa, tree, alpha=alpha,
+                variance_adjust=variance_adjust, validate=validate,
+            )
+            return DistanceMatrix(distances, ids)
+        if not NUMBA_AVAILABLE:
+            raise ImportError("generalized_unifrac requires numba.")
         distances = _generalized_unifrac_pdist_numba(
             counts, taxa=taxa, tree=tree, alpha=alpha,
             variance_adjust=variance_adjust, validate=validate,

@@ -36,7 +36,7 @@ _normalize_weighted_unifrac_by_default = False
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
 def unweighted_unifrac(
     u_counts, v_counts, taxa, tree, normalized=True, variance_adjust=False,
-    validate=True,
+    engine=None, validate=True,
 ):
     """Compute unweighted UniFrac.
 
@@ -61,6 +61,11 @@ def unweighted_unifrac(
         of branches whose node counts across the two samples have high
         variance. Requires numba to be installed; raises ``ImportError``
         otherwise.
+    engine : {'gpu'}, optional
+        If ``'gpu'``, dispatch to a GPU-accelerated implementation, raising
+        ``ImportError`` if no usable GPU backend (``numba-cuda`` or
+        ``numba.hip``) is detected. If ``None`` (default), use the standard
+        CPU implementation.
     validate: bool, optional
         If ``False``, validation of the input won't be performed. This step can
         be slow, so if validation is run elsewhere it can be disabled here.
@@ -79,6 +84,8 @@ def unweighted_unifrac(
     ------
     ValueError, MissingNodeError, DuplicateNodeError
         If validation fails. Exact error will depend on what was invalid.
+    ImportError
+        If ``engine='gpu'`` is requested but no usable GPU backend is found.
 
     See Also
     --------
@@ -167,6 +174,24 @@ def unweighted_unifrac(
     0.37
 
     """
+    if engine == "gpu":
+        from skbio.diversity.beta._unifrac_gpu import (
+            detect_gpu_backend, unweighted_unifrac_gpu,
+        )
+        if detect_gpu_backend() is None:
+            raise ImportError(
+                "engine='gpu' was requested but no usable GPU backend "
+                "(numba-cuda or numba.hip) was found."
+            )
+        # Single-pair GPU dispatch is wasteful (kernel launch overhead for
+        # one pair); route through the same GPU pdist driver beta_diversity
+        # uses, with a 2-row input.
+        counts = np.vstack([u_counts, v_counts])
+        distances = unweighted_unifrac_gpu(
+            counts, taxa, tree, normalized=normalized,
+            variance_adjust=variance_adjust, validate=validate,
+        )
+        return distances[0]
     if variance_adjust and not NUMBA_AVAILABLE:
         raise ImportError(
             "variance_adjust=True for unweighted_unifrac requires numba."
@@ -191,6 +216,7 @@ def weighted_unifrac(
     tree,
     normalized=_normalize_weighted_unifrac_by_default,
     variance_adjust=False,
+    engine=None,
     validate=True,
 ):
     """Compute weighted UniFrac with or without branch length normalization.
@@ -214,6 +240,11 @@ def weighted_unifrac(
         of branches whose node counts across the two samples have high
         variance. Requires numba to be installed; raises ``ImportError``
         otherwise.
+    engine : {'gpu'}, optional
+        If ``'gpu'``, dispatch to a GPU-accelerated implementation, raising
+        ``ImportError`` if no usable GPU backend (``numba-cuda`` or
+        ``numba.hip``) is detected. If ``None`` (default), use the standard
+        CPU implementation.
     validate: bool, optional
         If ``False``, validation of the input won't be performed. This step can
         be slow, so if validation is run elsewhere it can be disabled here.
@@ -232,6 +263,8 @@ def weighted_unifrac(
     ------
     ValueError, MissingNodeError, DuplicateNodeError
         If validation fails. Exact error will depend on what was invalid.
+    ImportError
+        If ``engine='gpu'`` is requested but no usable GPU backend is found.
 
     See Also
     --------
@@ -322,6 +355,24 @@ def weighted_unifrac(
     0.33
 
     """
+    if engine == "gpu":
+        from skbio.diversity.beta._unifrac_gpu import (
+            detect_gpu_backend, weighted_unifrac_gpu,
+        )
+        if detect_gpu_backend() is None:
+            raise ImportError(
+                "engine='gpu' was requested but no usable GPU backend "
+                "(numba-cuda or numba.hip) was found."
+            )
+        # Single-pair GPU dispatch is wasteful (kernel launch overhead for
+        # one pair); route through the same GPU pdist driver beta_diversity
+        # uses, with a 2-row input.
+        counts = np.vstack([u_counts, v_counts])
+        distances = weighted_unifrac_gpu(
+            counts, taxa, tree, normalized=normalized,
+            variance_adjust=variance_adjust, validate=validate,
+        )
+        return distances[0]
     (
         u_node_counts,
         v_node_counts,
@@ -1178,7 +1229,8 @@ def _generalized_unifrac(
 
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
 def generalized_unifrac(
-    u_counts, v_counts, taxa, tree, alpha=1.0, variance_adjust=False, validate=True,
+    u_counts, v_counts, taxa, tree, alpha=1.0, variance_adjust=False,
+    engine=None, validate=True,
 ):
     """Compute generalized UniFrac (GUniFrac).
 
@@ -1194,6 +1246,11 @@ def generalized_unifrac(
         GUniFrac alpha parameter in ``[0, 1]``, default 1.0.
     variance_adjust : bool, optional
         If ``True``, apply variance adjustment (VAW-UniFrac).
+    engine : {'gpu'}, optional
+        If ``'gpu'``, dispatch to a GPU-accelerated implementation, raising
+        ``ImportError`` if no usable GPU backend (``numba-cuda`` or
+        ``numba.hip``) is detected. If ``None`` (default), requires numba
+        to be installed (this function has no cython path).
     validate : bool, optional
         If ``False``, skip input validation.
 
@@ -1205,7 +1262,8 @@ def generalized_unifrac(
     Raises
     ------
     ImportError
-        If numba is not installed (this function has no cython path).
+        If numba is not installed (this function has no cython path), or if
+        ``engine='gpu'`` is requested but no usable GPU backend is found.
     ValueError
         If ``alpha`` is outside ``[0, 1]``.
 
@@ -1216,10 +1274,28 @@ def generalized_unifrac(
        Bioinformatics 28, 2106-2113 (2012).
 
     """
-    if not NUMBA_AVAILABLE:
-        raise ImportError("generalized_unifrac requires numba.")
     if not (0.0 <= alpha <= 1.0):
         raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+    if engine == "gpu":
+        from skbio.diversity.beta._unifrac_gpu import (
+            detect_gpu_backend, generalized_unifrac_gpu,
+        )
+        if detect_gpu_backend() is None:
+            raise ImportError(
+                "engine='gpu' was requested but no usable GPU backend "
+                "(numba-cuda or numba.hip) was found."
+            )
+        # Single-pair GPU dispatch is wasteful (kernel launch overhead for
+        # one pair); route through the same GPU pdist driver beta_diversity
+        # uses, with a 2-row input.
+        counts = np.vstack([u_counts, v_counts])
+        distances = generalized_unifrac_gpu(
+            counts, taxa, tree, alpha=alpha,
+            variance_adjust=variance_adjust, validate=validate,
+        )
+        return distances[0]
+    if not NUMBA_AVAILABLE:
+        raise ImportError("generalized_unifrac requires numba.")
     (
         u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index,
     ) = _setup_pairwise_unifrac(
