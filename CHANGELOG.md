@@ -10,6 +10,10 @@
 * Added `engine='gpu'` to `unweighted_unifrac`, `weighted_unifrac`, `generalized_unifrac` and `beta_diversity`, dispatching to a GPU-agnostic Numba kernel backed by `numba-cuda` on NVIDIA or `numba.hip` on AMD devices.
 * Added an optional `gpu-nvidia` extra for installing the NVIDIA GPU backend (`numba-cuda`). AMD support requires `numba-hip`, which is published only on test.pypi and must be pinned to match the installed ROCm version, so it has no extra and must be installed manually.
 
+### Backward-incompatible changes
+
+* `unweighted_unifrac`, `weighted_unifrac` and `generalized_unifrac` now require all parameters after `tree` to be passed as keyword arguments. Previously these were positional-or-keyword, so a call like `unweighted_unifrac(u, v, taxa, tree, False)` relied on positional order and silently changed meaning whenever a new parameter was inserted. Code calling these functions with more than 4 positional arguments must switch to keyword arguments.
+
 ## Version 0.7.4
 
 ### Features
