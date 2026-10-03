@@ -254,6 +254,27 @@ PR:**
   two backends" holds, not just that `pose_as_cuda()` runs without
   erroring.
 
+  **Measured figures (Task 13):**
+  - CPU-numba vs `ssu`-ascii-fixture: max abs deviation 1.332e-7
+    (`generalized_unifrac`, alpha=0.5, samples f2 vs p2), measured
+    across all 8 `ssu`-generated qiime-191-tt fixtures
+    (`unweighted_unnormalized`, `unweighted`/`weighted`/`generalized`
+    variance-adjusted variants, and both `generalized` alpha values)
+    and every sample pair in the tiny-test table. This is consistent
+    with the limited precision of `ssu`'s ASCII (`-r ascii`) output
+    format, not a correctness issue.
+  - GPU vs CPU-numba: overall max abs deviation 3.331e-16, measured
+    on real NVIDIA (RTX-3090, NRP) and AMD (MI300A, Cosmos) hardware
+    across all 12 method/`normalized`/`variance_adjust` combinations
+    — ordinary float64 accumulation noise, confirming "one kernel,
+    two backends" empirically.
+  - Committed test tolerances: `SSU_FIXTURE_TOLERANCE = 1.5e-6` (an
+    ~11x margin over the larger, CPU-vs-fixture figure above) for
+    fixture-comparison tests in `test_unifrac.py`, and
+    `GPU_CPU_TOLERANCE = 1e-10` (a ~3e5x margin over the GPU-vs-CPU
+    figure) for the direct GPU-vs-CPU-numba tests in
+    `test_unifrac_gpu.py`.
+
 CPU-path testing: same fixture comparisons, plus the existing
 both-samples-empty/single-tip edge cases extended to the new
 methods/kwargs, plus `ImportError`/`ValueError` dispatch tests, plus

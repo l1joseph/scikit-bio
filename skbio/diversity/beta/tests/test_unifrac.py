@@ -28,6 +28,14 @@ from skbio.diversity._driver import _UNIFRAC_FAST_ENGINE
 from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
 from skbio.util import numba_code
 
+# Measured max abs deviation, CPU-numba vs ssu-ascii-fixture, across all 8
+# qiime-191-tt generalized/variance_adjust fixtures and every sample pair:
+# 1.332e-7 (generalized_unifrac, alpha=0.5, f2 vs p2). GPU-vs-CPU-numba
+# deviation is far tighter (3.331e-16, measured on real NVIDIA/AMD hardware).
+# See docs/superpowers/specs/2026-10-02-ssu-unifrac-numba-phase1-design.md.
+# 1.5e-6 gives an ~11x safety margin over the larger (ssu-fixture) figure.
+SSU_FIXTURE_TOLERANCE = 1.5e-6
+
 
 class UnifracTests(QiimeTinyTestMixin, TestCase):
 
@@ -421,7 +429,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 table[i], table[j], taxa, tree, normalized=False
             )
             self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+                obs, expected[sample_ids[i], sample_ids[j]],
+                delta=SSU_FIXTURE_TOLERANCE)
 
     def test_unweighted_unifrac_variance_adjust_matches_ssu_fixture(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -431,7 +440,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 table[i], table[j], taxa, tree, variance_adjust=True
             )
             self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+                obs, expected[sample_ids[i], sample_ids[j]],
+                delta=SSU_FIXTURE_TOLERANCE)
 
     @skipIf(NUMBA_AVAILABLE, "numba is installed")
     def test_unweighted_unifrac_variance_adjust_requires_numba(self):
@@ -744,7 +754,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         for i, j in [(0, 1), (2, 5), (3, 7)]:
             obs = weighted_unifrac(table[i], table[j], taxa, tree, variance_adjust=True)
             self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+                obs, expected[sample_ids[i], sample_ids[j]],
+                delta=SSU_FIXTURE_TOLERANCE)
 
     def test_weighted_unifrac_variance_adjust_matches_ssu_fixture_normalized(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -754,7 +765,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 table[i], table[j], taxa, tree, normalized=True, variance_adjust=True
             )
             self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]], places=5)
+                obs, expected[sample_ids[i], sample_ids[j]],
+                delta=SSU_FIXTURE_TOLERANCE)
 
     @skipIf(NUMBA_AVAILABLE, "numba is installed")
     def test_weighted_unifrac_variance_adjust_requires_numba(self):
@@ -815,7 +827,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
             for i, j in [(0, 1), (2, 5), (3, 7)]:
                 obs = generalized_unifrac(table[i], table[j], taxa, tree, alpha=alpha)
                 self.assertAlmostEqual(
-                    obs, expected[sample_ids[i], sample_ids[j]], places=5
+                    obs, expected[sample_ids[i], sample_ids[j]],
+                    delta=SSU_FIXTURE_TOLERANCE
                 )
 
     def test_generalized_unifrac_variance_adjust_matches_ssu_fixture(self):
@@ -826,7 +839,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 table[i], table[j], taxa, tree, alpha=1.0, variance_adjust=True
             )
             self.assertAlmostEqual(
-                obs, expected[sample_ids[i], sample_ids[j]], places=5
+                obs, expected[sample_ids[i], sample_ids[j]],
+                delta=SSU_FIXTURE_TOLERANCE
             )
 
     def test_generalized_unifrac_alpha_out_of_range_raises(self):
@@ -1061,7 +1075,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         )
         expected = self._load_dm_fixture('generalized_unifrac_alpha0.5_dm.txt')
         self.assertAlmostEqual(
-            dm['f2', 'f1'], expected['f2', 'f1'], places=5
+            dm['f2', 'f1'], expected['f2', 'f1'], delta=SSU_FIXTURE_TOLERANCE
         )
 
     def test_beta_diversity_unweighted_unifrac_variance_adjust(self):
@@ -1071,7 +1085,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
             variance_adjust=True,
         )
         expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
-        self.assertAlmostEqual(dm['f2', 'f1'], expected['f2', 'f1'], places=5)
+        self.assertAlmostEqual(
+            dm['f2', 'f1'], expected['f2', 'f1'], delta=SSU_FIXTURE_TOLERANCE)
 
     def test_beta_diversity_weighted_unifrac_variance_adjust(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -1084,7 +1099,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 normalized=normalized, variance_adjust=True,
             )
             expected = self._load_dm_fixture(fname)
-            self.assertAlmostEqual(dm['f2', 'f1'], expected['f2', 'f1'], places=5)
+            self.assertAlmostEqual(
+                dm['f2', 'f1'], expected['f2', 'f1'], delta=SSU_FIXTURE_TOLERANCE)
 
     def test_beta_diversity_engine_invalid(self):
         with self.assertRaisesRegex(

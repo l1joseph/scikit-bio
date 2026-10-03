@@ -20,6 +20,14 @@ from skbio.diversity.beta._unifrac_gpu import (
 )
 from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
 
+# Measured max abs deviation, GPU vs CPU-numba, across all 12
+# method/normalized/variance_adjust combinations on the qiime-191-tt table:
+# 3.331e-16 (ordinary float64 noise), confirmed on real NVIDIA and AMD
+# hardware -- see
+# docs/superpowers/specs/2026-10-02-ssu-unifrac-numba-phase1-design.md.
+# 1e-10 gives a huge (~3e5x) safety margin.
+GPU_CPU_TOLERANCE = 1e-10
+
 
 class GpuBackendTests(TestCase):
 
@@ -81,7 +89,7 @@ class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _weighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=False, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
     def test_weighted_unifrac_gpu_matches_cpu_normalized(self):
         from skbio.diversity.beta._unifrac import _weighted_unifrac_pdist_numba
@@ -93,7 +101,7 @@ class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _weighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=True, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
 
 class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
@@ -112,7 +120,7 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _unweighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=False, variance_adjust=False, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
     def test_unweighted_unifrac_gpu_matches_cpu_normalized(self):
         from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
@@ -124,7 +132,7 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _unweighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=True, variance_adjust=False, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
     def test_unweighted_unifrac_gpu_matches_cpu_variance_adjusted_unnormalized(self):
         from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
@@ -136,7 +144,7 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _unweighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=False, variance_adjust=True, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
     def test_unweighted_unifrac_gpu_matches_cpu_variance_adjusted_normalized(self):
         from skbio.diversity.beta._unifrac import _unweighted_unifrac_pdist_numba
@@ -148,7 +156,7 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _unweighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=True, variance_adjust=True, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
 
 class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
@@ -166,7 +174,7 @@ class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _generalized_unifrac_pdist_numba(
             table, taxa, tree, alpha=0.5, variance_adjust=False, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
     def test_generalized_unifrac_gpu_matches_cpu_alpha_one(self):
         from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba
@@ -177,7 +185,7 @@ class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _generalized_unifrac_pdist_numba(
             table, taxa, tree, alpha=1.0, variance_adjust=False, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
     def test_generalized_unifrac_gpu_matches_cpu_variance_adjusted(self):
         from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba
@@ -188,7 +196,7 @@ class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         cpu = _generalized_unifrac_pdist_numba(
             table, taxa, tree, alpha=0.5, variance_adjust=True, validate=True
         )
-        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
 
 if __name__ == "__main__":

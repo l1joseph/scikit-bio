@@ -2,6 +2,12 @@
 
 ## Version 0.7.5-dev
 
+### Features
+
+* Added `generalized_unifrac` (GUniFrac) to `skbio.diversity.beta`, with an `alpha` parameter controlling the weight given to abundant lineages.
+* Added `variance_adjust` to `unweighted_unifrac` and `weighted_unifrac`, downweighting branches whose node counts across the two samples have high variance.
+* Added `engine='gpu'` to `unweighted_unifrac`, `weighted_unifrac`, `generalized_unifrac` and `beta_diversity`, dispatching to a GPU-agnostic Numba kernel backed by `numba-cuda` on NVIDIA or `numba.hip` on AMD devices.
+* Added optional `gpu-nvidia` and `gpu-amd` extras for installing the NVIDIA (`numba-cuda`) and AMD (`hip-python`) GPU backends.
 
 ## Version 0.7.4
 
