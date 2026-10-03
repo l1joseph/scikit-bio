@@ -1129,3 +1129,245 @@ def _weighted_unifrac_branch_correction(
     return (
         node_to_root_distances.ravel() * (u_node_proportions + v_node_proportions)
     ).sum()
+
+
+def _generalized_unifrac(
+    u_node_counts, v_node_counts, u_total_count, v_total_count, branch_lengths,
+    alpha, variance_adjust,
+):
+    """Calculate generalized UniFrac (GUniFrac) distance between samples.
+
+    Notes
+    -----
+    The count vectors passed here correspond to all nodes in the tree, not
+    just the tips. This sums directly over every node using the raw
+    ``branch_lengths`` -- there is no tip-to-root-distance shortcut.
+
+    """
+    if u_total_count > 0:
+        up = u_node_counts / u_total_count
+    else:
+        up = u_node_counts.astype(np.float64)
+    if v_total_count > 0:
+        vp = v_node_counts / v_total_count
+    else:
+        vp = v_node_counts.astype(np.float64)
+    s = up + vp
+    d = np.abs(up - vp)
+    if variance_adjust:
+        # m is the scalar per-sample total (same value for every node), not
+        # a per-node quantity -- this bug class has bitten this plan before.
+        m = u_total_count + v_total_count
+        mi = u_node_counts.astype(np.float64) + v_node_counts
+        with np.errstate(invalid="ignore"):
+            vaw = np.sqrt(mi * (m - mi))
+        mask = (vaw > 0) & (s != 0.0)
+        safe_vaw = np.where(vaw > 0, vaw, 1.0)
+        s = s / safe_vaw
+        d = d / safe_vaw
+    else:
+        mask = s != 0.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sum_pow = np.where(mask, branch_lengths * np.power(s, alpha), 0.0)
+        numerator = np.where(mask, sum_pow * (d / np.where(s != 0, s, 1.0)), 0.0).sum()
+    denominator = sum_pow.sum()
+    if denominator == 0.0:
+        return 0.0
+    return numerator / denominator
+
+
+@params_aliased([("taxa", "otu_ids", "0.6.0", True)])
+def generalized_unifrac(
+    u_counts, v_counts, taxa, tree, alpha=1.0, variance_adjust=False, validate=True,
+):
+    """Compute generalized UniFrac (GUniFrac).
+
+    Parameters
+    ----------
+    u_counts, v_counts : list, np.array
+        Vectors of counts/abundances of taxa for two samples.
+    taxa : list, np.array
+        Vector of taxon IDs corresponding to tip names in ``tree``.
+    tree : TreeNode
+        Tree relating taxa.
+    alpha : float, optional
+        GUniFrac alpha parameter in ``[0, 1]``, default 1.0.
+    variance_adjust : bool, optional
+        If ``True``, apply variance adjustment (VAW-UniFrac).
+    validate : bool, optional
+        If ``False``, skip input validation.
+
+    Returns
+    -------
+    float
+        The generalized UniFrac distance between the two samples.
+
+    Raises
+    ------
+    ImportError
+        If numba is not installed (this function has no cython path).
+    ValueError
+        If ``alpha`` is outside ``[0, 1]``.
+
+    References
+    ----------
+    .. [1] Chen, J. et al. Associating microbiome composition with
+       environmental covariates using generalized UniFrac distances.
+       Bioinformatics 28, 2106-2113 (2012).
+
+    """
+    if not NUMBA_AVAILABLE:
+        raise ImportError("generalized_unifrac requires numba.")
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+    (
+        u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index,
+    ) = _setup_pairwise_unifrac(
+        u_counts, v_counts, taxa, tree, validate, normalized=True, unweighted=False,
+    )
+    if u_total_count == 0.0 and v_total_count == 0.0:
+        return 0.0
+    return _generalized_unifrac(
+        u_node_counts, v_node_counts, u_total_count, v_total_count,
+        tree_index["length"], alpha, variance_adjust,
+    )
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(inline="always")
+    def _generalized_unifrac_row_nb(
+        row, n_samples, n_nodes, counts_by_node, branch_lengths, sample_totals,
+        alpha, variance_adjust, out,
+    ):
+        """Fill out[] with row's distance to every sample j > row.
+
+        Factored out of _generalized_unifrac_pdist_nb so its prange loop can
+        call it once for a row and once for that row's mirror without
+        duplicating the body; inline="always" makes this compile to the same
+        code as writing it out twice.
+        """
+        base = _condensed_row_base(row, n_samples)
+        row_total = sample_totals[row]
+        for j in range(row + 1, n_samples):
+            v_total = sample_totals[j]
+            numerator = 0.0
+            denominator = 0.0
+            for k in range(n_nodes):
+                up = counts_by_node[row, k] / row_total if row_total > 0.0 else 0.0
+                vp = counts_by_node[j, k] / v_total if v_total > 0.0 else 0.0
+                s = up + vp
+                d = abs(up - vp)
+                if variance_adjust:
+                    # Scalar per-pair total, shared by every node's VAW term
+                    # below -- not a per-node quantity.
+                    m = row_total + v_total
+                    mi = counts_by_node[row, k] + counts_by_node[j, k]
+                    vaw = np.sqrt(mi * (m - mi))
+                    if vaw <= 0.0:
+                        continue
+                    s = s / vaw
+                    d = d / vaw
+                if s == 0.0:
+                    continue
+                length = branch_lengths[k]
+                sum_pow = length * s ** alpha
+                numerator += sum_pow * (d / s)
+                denominator += sum_pow
+            idx = base + j
+            out[idx] = 0.0 if denominator == 0.0 else numerator / denominator
+
+    @njit(parallel=True)
+    def _generalized_unifrac_pdist_nb(
+        counts_by_node, branch_lengths, sample_totals, alpha, variance_adjust,
+    ):
+        """Full generalized UniFrac distance matrix (condensed) via Numba.
+
+        Computes the condensed pairwise generalized UniFrac (GUniFrac)
+        distance vector in a single parallel pass. Parallelised over the
+        first sample index ``i`` (``prange``); the inner ``j`` and node loops
+        are sequential. Each ``(i, j)`` pair writes a unique condensed index,
+        so there are no write races.
+
+        Reproduces exactly the reference algorithm in
+        ``_generalized_unifrac``: node proportions are the per-sample node
+        counts divided by the sample's tip-count total (``0.0`` when the
+        total is ``0``); each node contributes
+        ``branch_length * (up + vp) ** alpha`` to the denominator and
+        additionally ``* |up - vp| / (up + vp)`` to the numerator, and the
+        distance is ``numerator / denominator`` (``0.0`` when the
+        denominator is ``0``). When ``variance_adjust`` is ``True``, ``up +
+        vp`` and ``|up - vp|`` are each additionally divided by ``sqrt(mi *
+        (m - mi))`` (``m`` the scalar sum of the two samples' tip-count
+        totals, ``mi`` the per-node sum of the two samples' counts), and
+        nodes where that quantity is non-positive contribute zero.
+
+        Sample ``i``'s tip-count total depends only on ``i``, so it's read
+        once per ``i`` via ``sample_totals``; ``counts_by_node`` is expected
+        to already be C-contiguous (the caller arranges this).
+
+        Parameters
+        ----------
+        counts_by_node : np.ndarray of shape (n_samples, n_nodes)
+            Per-node counts (tips + internal), summed up the tree.
+        branch_lengths : np.ndarray of shape (n_nodes,), float64
+            Branch length of each node, postorder.
+        sample_totals : np.ndarray of shape (n_samples,), float64
+            Per-sample sum of tip counts.
+        alpha : float
+            GUniFrac alpha parameter in ``[0, 1]``.
+        variance_adjust : bool
+            Whether to apply variance adjustment.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples * (n_samples - 1) // 2,), float64
+            Condensed (upper-triangle) distance vector, ordered as
+            ``scipy.spatial.distance.pdist``.
+
+        """
+        n_samples = counts_by_node.shape[0]
+        n_nodes = counts_by_node.shape[1]
+        n_pairs = n_samples * (n_samples - 1) // 2
+        out = np.empty(n_pairs, np.float64)
+        n_half = n_samples // 2
+
+        for i in prange(n_half):
+            _generalized_unifrac_row_nb(
+                i, n_samples, n_nodes, counts_by_node, branch_lengths,
+                sample_totals, alpha, variance_adjust, out,
+            )
+            mirror_i = n_samples - i - 2
+            if mirror_i != i:
+                _generalized_unifrac_row_nb(
+                    mirror_i, n_samples, n_nodes, counts_by_node, branch_lengths,
+                    sample_totals, alpha, variance_adjust, out,
+                )
+
+        return out
+
+
+def _generalized_unifrac_pdist_numba(
+    counts, taxa, tree, alpha, variance_adjust, validate,
+):
+    """Compute the condensed generalized UniFrac distance vector (Numba).
+
+    Builds the per-node counts, branch lengths, and per-sample tip-count
+    totals (reusing ``_setup_multiple_unifrac`` and ``_get_tip_indices``),
+    then dispatches to the parallel Numba kernel. Returns a condensed
+    distance vector consumable by ``DistanceMatrix``.
+
+    """
+    counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
+        counts, taxa, tree, validate
+    )
+    # counts_by_node is a transposed view (see _setup_multiple_unifrac) and so
+    # not C-contiguous along the node axis the kernel's inner loop walks;
+    # ascontiguousarray pays that cost once here instead of on every strided
+    # read inside the O(n_samples^2 * n_nodes) kernel.
+    counts_by_node = np.ascontiguousarray(counts_by_node)
+    tip_indices = _get_tip_indices(tree_index)
+    sample_totals = counts_by_node[:, tip_indices].sum(axis=1, dtype=np.float64)
+    return _generalized_unifrac_pdist_nb(
+        counts_by_node, branch_lengths, sample_totals, alpha, variance_adjust,
+    )

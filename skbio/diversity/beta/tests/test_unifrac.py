@@ -15,11 +15,13 @@ import numpy as np
 from skbio import TreeNode, DistanceMatrix
 from skbio.tree import DuplicateNodeError, MissingNodeError
 from skbio.diversity import beta_diversity
-from skbio.diversity.beta import unweighted_unifrac, weighted_unifrac
+from skbio.diversity.beta import (unweighted_unifrac, weighted_unifrac,
+                                  generalized_unifrac)
 from skbio.diversity.beta._unifrac import (_unweighted_unifrac,
                                            _weighted_unifrac,
                                            _weighted_unifrac_branch_correction,
                                            _weighted_unifrac_pdist_numba,
+                                           _generalized_unifrac_pdist_numba,
                                            NUMBA_AVAILABLE)
 from skbio.diversity._driver import _UNIFRAC_FAST_ENGINE
 from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
@@ -802,6 +804,74 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                     self.assertAlmostEqual(
                         obs[sample_ids[i], sample_ids[j]], expected, places=10,
                     )
+
+    def test_generalized_unifrac_matches_ssu_fixture(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        for alpha, fname in [(0.5, 'generalized_unifrac_alpha0.5_dm.txt'),
+                             (1.0, 'generalized_unifrac_alpha1.0_dm.txt')]:
+            expected = self._load_dm_fixture(fname)
+            for i, j in [(0, 1), (2, 5), (3, 7)]:
+                obs = generalized_unifrac(table[i], table[j], taxa, tree, alpha=alpha)
+                self.assertAlmostEqual(
+                    obs, expected[sample_ids[i], sample_ids[j]], places=5
+                )
+
+    def test_generalized_unifrac_variance_adjust_matches_ssu_fixture(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture('generalized_unifrac_alpha1.0_vaw_dm.txt')
+        for i, j in [(0, 1), (2, 5), (3, 7)]:
+            obs = generalized_unifrac(
+                table[i], table[j], taxa, tree, alpha=1.0, variance_adjust=True
+            )
+            self.assertAlmostEqual(
+                obs, expected[sample_ids[i], sample_ids[j]], places=5
+            )
+
+    def test_generalized_unifrac_alpha_out_of_range_raises(self):
+        with self.assertRaises(ValueError):
+            generalized_unifrac(
+                [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1, alpha=1.5
+            )
+
+    def test_generalized_unifrac_both_empty_is_zero(self):
+        obs = generalized_unifrac(
+            [0, 0, 0], [0, 0, 0], self.oids1[:3], self.t1
+        )
+        self.assertEqual(obs, 0.0)
+
+    @skipIf(NUMBA_AVAILABLE, "numba is installed")
+    def test_generalized_unifrac_requires_numba(self):
+        # Unlike unweighted/weighted_unifrac, generalized_unifrac has no
+        # cython fallback at all, so it must raise even without
+        # variance_adjust=True.
+        with self.assertRaises(ImportError):
+            generalized_unifrac([1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1)
+
+    @numba_code
+    def test_generalized_unifrac_pdist_numba_matches_single_pair(self):
+        # generalized_unifrac has no cython/pairwise_func counterpart to
+        # compare the numba pdist kernel against, so cross-check
+        # _generalized_unifrac_pdist_numba directly against the single-pair
+        # generalized_unifrac path (already validated against the SSU
+        # fixtures above) for every pair in the tiny-test table, across both
+        # alpha values and with/without variance_adjust.
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        n = table.shape[0]
+        for alpha in (0.5, 1.0):
+            for variance_adjust in (False, True):
+                condensed = _generalized_unifrac_pdist_numba(
+                    table, taxa, tree, alpha, variance_adjust, True,
+                )
+                obs = DistanceMatrix(condensed, sample_ids)
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        expected = generalized_unifrac(
+                            table[i], table[j], taxa, tree,
+                            alpha=alpha, variance_adjust=variance_adjust,
+                        )
+                        self.assertAlmostEqual(
+                            obs[sample_ids[i], sample_ids[j]], expected, places=10,
+                        )
 
     @numba_code
     def test_unweighted_unifrac_engine_numba_matches_cython(self):
