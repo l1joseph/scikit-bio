@@ -146,8 +146,12 @@ def _make_unifrac_kernel(cuda):
                 observed = p_u > 0.0 or p_v > 0.0
                 differs = (p_u > 0.0) != (p_v > 0.0)
                 if observed:
-                    numerator += length if differs else 0.0
-                    denominator += length
+                    if variance_adjust:
+                        numerator += length / vaw if differs else 0.0
+                        denominator += length / vaw
+                    else:
+                        numerator += length if differs else 0.0
+                        denominator += length
             elif method == GENERALIZED:
                 if s == 0.0:
                     continue
