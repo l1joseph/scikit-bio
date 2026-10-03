@@ -33,10 +33,28 @@ except ImportError:
 _normalize_weighted_unifrac_by_default = False
 
 
+def _validate_unifrac_engine(engine):
+    """Reject engine values the single-pair UniFrac functions cannot honor.
+
+    Only ``None`` (CPU) and ``'gpu'`` are meaningful here. Without this
+    check, a typo such as ``engine='cuda'`` or ``engine='GPU'`` would fall
+    through to the CPU path and silently ignore the request.
+    """
+    if engine not in (None, "gpu"):
+        raise ValueError(f"engine must be None or 'gpu', got {engine!r}.")
+
+
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
 def unweighted_unifrac(
-    u_counts, v_counts, taxa, tree, normalized=True, variance_adjust=False,
-    engine=None, validate=True,
+    u_counts,
+    v_counts,
+    taxa,
+    tree,
+    *,
+    normalized=True,
+    variance_adjust=False,
+    engine=None,
+    validate=True,
 ):
     """Compute unweighted UniFrac.
 
@@ -83,7 +101,8 @@ def unweighted_unifrac(
     Raises
     ------
     ValueError, MissingNodeError, DuplicateNodeError
-        If validation fails. Exact error will depend on what was invalid.
+        If validation fails, or if ``engine`` is neither ``None`` nor
+        ``'gpu'``. Exact error will depend on what was invalid.
     ImportError
         If ``engine='gpu'`` is requested but no usable GPU backend is found.
 
@@ -174,10 +193,13 @@ def unweighted_unifrac(
     0.37
 
     """
+    _validate_unifrac_engine(engine)
     if engine == "gpu":
         from skbio.diversity.beta._unifrac_gpu import (
-            detect_gpu_backend, unweighted_unifrac_gpu,
+            detect_gpu_backend,
+            unweighted_unifrac_gpu,
         )
+
         if detect_gpu_backend() is None:
             raise ImportError(
                 "engine='gpu' was requested but no usable GPU backend "
@@ -188,23 +210,33 @@ def unweighted_unifrac(
         # uses, with a 2-row input.
         counts = np.vstack([u_counts, v_counts])
         distances = unweighted_unifrac_gpu(
-            counts, taxa, tree, normalized=normalized,
-            variance_adjust=variance_adjust, validate=validate,
+            counts,
+            taxa,
+            tree,
+            normalized=normalized,
+            variance_adjust=variance_adjust,
+            validate=validate,
         )
         return distances[0]
     if variance_adjust and not NUMBA_AVAILABLE:
-        raise ImportError(
-            "variance_adjust=True for unweighted_unifrac requires numba."
-        )
+        raise ImportError("variance_adjust=True for unweighted_unifrac requires numba.")
     (
-        u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index,
+        u_node_counts,
+        v_node_counts,
+        u_total_count,
+        v_total_count,
+        tree_index,
     ) = _setup_pairwise_unifrac(
         u_counts, v_counts, taxa, tree, validate, normalized=False, unweighted=True
     )
     return _unweighted_unifrac(
-        u_node_counts, v_node_counts, tree_index["length"],
-        normalized=normalized, variance_adjust=variance_adjust,
-        u_total_count=u_total_count, v_total_count=v_total_count,
+        u_node_counts,
+        v_node_counts,
+        tree_index["length"],
+        normalized=normalized,
+        variance_adjust=variance_adjust,
+        u_total_count=u_total_count,
+        v_total_count=v_total_count,
     )
 
 
@@ -214,6 +246,7 @@ def weighted_unifrac(
     v_counts,
     taxa,
     tree,
+    *,
     normalized=_normalize_weighted_unifrac_by_default,
     variance_adjust=False,
     engine=None,
@@ -262,7 +295,8 @@ def weighted_unifrac(
     Raises
     ------
     ValueError, MissingNodeError, DuplicateNodeError
-        If validation fails. Exact error will depend on what was invalid.
+        If validation fails, or if ``engine`` is neither ``None`` nor
+        ``'gpu'``. Exact error will depend on what was invalid.
     ImportError
         If ``engine='gpu'`` is requested but no usable GPU backend is found.
 
@@ -355,10 +389,13 @@ def weighted_unifrac(
     0.33
 
     """
+    _validate_unifrac_engine(engine)
     if engine == "gpu":
         from skbio.diversity.beta._unifrac_gpu import (
-            detect_gpu_backend, weighted_unifrac_gpu,
+            detect_gpu_backend,
+            weighted_unifrac_gpu,
         )
+
         if detect_gpu_backend() is None:
             raise ImportError(
                 "engine='gpu' was requested but no usable GPU backend "
@@ -369,8 +406,12 @@ def weighted_unifrac(
         # uses, with a 2-row input.
         counts = np.vstack([u_counts, v_counts])
         distances = weighted_unifrac_gpu(
-            counts, taxa, tree, normalized=normalized,
-            variance_adjust=variance_adjust, validate=validate,
+            counts,
+            taxa,
+            tree,
+            normalized=normalized,
+            variance_adjust=variance_adjust,
+            validate=validate,
         )
         return distances[0]
     (
@@ -438,8 +479,13 @@ def _setup_pairwise_unifrac(
 
 
 def _unweighted_unifrac(
-    u_node_counts, v_node_counts, branch_lengths, normalized=True,
-    variance_adjust=False, u_total_count=None, v_total_count=None,
+    u_node_counts,
+    v_node_counts,
+    branch_lengths,
+    normalized=True,
+    variance_adjust=False,
+    u_total_count=None,
+    v_total_count=None,
 ):
     """Calculate unweighted UniFrac distance between samples.
 
@@ -599,7 +645,11 @@ def _weighted_unifrac_normalized(
 
 
 def _weighted_unifrac_vaw(
-    u_node_counts, v_node_counts, u_total_count, v_total_count, branch_lengths,
+    u_node_counts,
+    v_node_counts,
+    u_total_count,
+    v_total_count,
+    branch_lengths,
     normalized,
 ):
     """Calculate variance-adjusted weighted UniFrac distance between samples.
@@ -669,7 +719,7 @@ def _setup_multiple_unifrac(counts, taxa, tree, validate):
     return counts_by_node, tree_index, branch_lengths
 
 
-def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate):
+def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate, normalized=True):
     r"""Create optimized pdist-compatible unweighted UniFrac function.
 
     Parameters
@@ -686,6 +736,9 @@ def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate):
         of ``taxa``, but not a subset.
     validate: bool, optional
         If ``False``, validation of the input won't be performed.
+    normalized : bool, optional
+        If ``True`` (default), divide the unique branch length by the observed
+        branch length.
 
     Returns
     -------
@@ -700,7 +753,9 @@ def _setup_multiple_unweighted_unifrac(counts, taxa, tree, validate):
         counts, taxa, tree, validate
     )
 
-    f = partial(_unweighted_unifrac, branch_lengths=branch_lengths)
+    f = partial(
+        _unweighted_unifrac, branch_lengths=branch_lengths, normalized=normalized
+    )
 
     return f, counts_by_node
 
@@ -714,8 +769,15 @@ if NUMBA_AVAILABLE:
 
     @njit(inline="always")
     def _unweighted_unifrac_row_nb(
-        row, n_samples, n_nodes, counts_by_node, branch_lengths, sample_totals,
-        normalized, variance_adjust, out,
+        row,
+        n_samples,
+        n_nodes,
+        counts_by_node,
+        branch_lengths,
+        sample_totals,
+        normalized,
+        variance_adjust,
+        out,
     ):
         """Fill out[] with row's distance to every sample j > row.
 
@@ -756,7 +818,11 @@ if NUMBA_AVAILABLE:
 
     @njit(parallel=True)
     def _unweighted_unifrac_pdist_nb(
-        counts_by_node, branch_lengths, sample_totals, normalized, variance_adjust,
+        counts_by_node,
+        branch_lengths,
+        sample_totals,
+        normalized,
+        variance_adjust,
     ):
         """Full unweighted UniFrac distance matrix (condensed) via Numba.
 
@@ -823,21 +889,41 @@ if NUMBA_AVAILABLE:
         # _permanova_f_stat_sW_condensed_nb already makes.
         for i in prange(n_half):
             _unweighted_unifrac_row_nb(
-                i, n_samples, n_nodes, counts_by_node, branch_lengths,
-                sample_totals, normalized, variance_adjust, out,
+                i,
+                n_samples,
+                n_nodes,
+                counts_by_node,
+                branch_lengths,
+                sample_totals,
+                normalized,
+                variance_adjust,
+                out,
             )
             mirror_i = n_samples - i - 2
             if mirror_i != i:
                 _unweighted_unifrac_row_nb(
-                    mirror_i, n_samples, n_nodes, counts_by_node, branch_lengths,
-                    sample_totals, normalized, variance_adjust, out,
+                    mirror_i,
+                    n_samples,
+                    n_nodes,
+                    counts_by_node,
+                    branch_lengths,
+                    sample_totals,
+                    normalized,
+                    variance_adjust,
+                    out,
                 )
 
         return out
 
 
 def _unweighted_unifrac_pdist_numba(
-    counts, taxa, tree, validate, normalized=True, variance_adjust=False,
+    counts,
+    taxa,
+    tree,
+    *,
+    normalized=True,
+    variance_adjust=False,
+    validate=True,
 ):
     """Compute the condensed unweighted UniFrac distance vector (Numba engine).
 
@@ -846,6 +932,10 @@ def _unweighted_unifrac_pdist_numba(
     ``_setup_multiple_unifrac`` and ``_get_tip_indices``), then dispatches to
     the parallel Numba kernel. Returns a condensed distance vector consumable
     by ``DistanceMatrix``.
+
+    Everything after ``tree`` is keyword-only: the three ``*_pdist_numba``
+    kernels take different options, and passing them positionally made the
+    orders easy to confuse.
 
     """
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
@@ -862,7 +952,11 @@ def _unweighted_unifrac_pdist_numba(
     else:
         sample_totals = np.zeros(0, dtype=np.float64)
     return _unweighted_unifrac_pdist_nb(
-        counts_by_node, branch_lengths, sample_totals, normalized, variance_adjust,
+        counts_by_node,
+        branch_lengths,
+        sample_totals,
+        normalized,
+        variance_adjust,
     )
 
 
@@ -1040,7 +1134,13 @@ if NUMBA_AVAILABLE:
 
 
 def _weighted_unifrac_pdist_numba(
-    counts, taxa, tree, normalized, validate, variance_adjust=False,
+    counts,
+    taxa,
+    tree,
+    *,
+    normalized=_normalize_weighted_unifrac_by_default,
+    variance_adjust=False,
+    validate=True,
 ):
     """Compute the condensed weighted UniFrac distance vector (Numba engine).
 
@@ -1049,6 +1149,9 @@ def _weighted_unifrac_pdist_numba(
     ``_get_tip_indices``, and ``_tip_distances``), then dispatches to the parallel
     Numba kernel. Returns a condensed distance vector consumable by
     ``DistanceMatrix``.
+
+    Everything after ``tree`` is keyword-only; see
+    ``_unweighted_unifrac_pdist_numba``.
 
     """
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
@@ -1183,8 +1286,13 @@ def _weighted_unifrac_branch_correction(
 
 
 def _generalized_unifrac(
-    u_node_counts, v_node_counts, u_total_count, v_total_count, branch_lengths,
-    alpha, variance_adjust,
+    u_node_counts,
+    v_node_counts,
+    u_total_count,
+    v_total_count,
+    branch_lengths,
+    alpha,
+    variance_adjust,
 ):
     """Calculate generalized UniFrac (GUniFrac) distance between samples.
 
@@ -1229,8 +1337,15 @@ def _generalized_unifrac(
 
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
 def generalized_unifrac(
-    u_counts, v_counts, taxa, tree, alpha=1.0, variance_adjust=False,
-    engine=None, validate=True,
+    u_counts,
+    v_counts,
+    taxa,
+    tree,
+    *,
+    alpha=1.0,
+    variance_adjust=False,
+    engine=None,
+    validate=True,
 ):
     """Compute generalized UniFrac (GUniFrac).
 
@@ -1265,7 +1380,8 @@ def generalized_unifrac(
         If numba is not installed (this function has no cython path), or if
         ``engine='gpu'`` is requested but no usable GPU backend is found.
     ValueError
-        If ``alpha`` is outside ``[0, 1]``.
+        If ``alpha`` is outside ``[0, 1]``, or if ``engine`` is neither
+        ``None`` nor ``'gpu'``.
 
     References
     ----------
@@ -1274,10 +1390,13 @@ def generalized_unifrac(
        Bioinformatics 28, 2106-2113 (2012).
 
     """
+    _validate_unifrac_engine(engine)
     if engine == "gpu":
         from skbio.diversity.beta._unifrac_gpu import (
-            detect_gpu_backend, generalized_unifrac_gpu,
+            detect_gpu_backend,
+            generalized_unifrac_gpu,
         )
+
         if detect_gpu_backend() is None:
             raise ImportError(
                 "engine='gpu' was requested but no usable GPU backend "
@@ -1293,20 +1412,39 @@ def generalized_unifrac(
         # uses, with a 2-row input.
         counts = np.vstack([u_counts, v_counts])
         distances = generalized_unifrac_gpu(
-            counts, taxa, tree, alpha=alpha,
-            variance_adjust=variance_adjust, validate=validate,
+            counts,
+            taxa,
+            tree,
+            alpha=alpha,
+            variance_adjust=variance_adjust,
+            validate=validate,
         )
         return distances[0]
     (
-        u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index,
+        u_node_counts,
+        v_node_counts,
+        u_total_count,
+        v_total_count,
+        tree_index,
     ) = _setup_pairwise_unifrac(
-        u_counts, v_counts, taxa, tree, validate, normalized=True, unweighted=False,
+        u_counts,
+        v_counts,
+        taxa,
+        tree,
+        validate,
+        normalized=True,
+        unweighted=False,
     )
     if u_total_count == 0.0 and v_total_count == 0.0:
         return 0.0
     return _generalized_unifrac(
-        u_node_counts, v_node_counts, u_total_count, v_total_count,
-        tree_index["length"], alpha, variance_adjust,
+        u_node_counts,
+        v_node_counts,
+        u_total_count,
+        v_total_count,
+        tree_index["length"],
+        alpha,
+        variance_adjust,
     )
 
 
@@ -1314,8 +1452,15 @@ if NUMBA_AVAILABLE:
 
     @njit(inline="always")
     def _generalized_unifrac_row_nb(
-        row, n_samples, n_nodes, counts_by_node, branch_lengths, sample_totals,
-        alpha, variance_adjust, out,
+        row,
+        n_samples,
+        n_nodes,
+        counts_by_node,
+        branch_lengths,
+        sample_totals,
+        alpha,
+        variance_adjust,
+        out,
     ):
         """Fill out[] with row's distance to every sample j > row.
 
@@ -1348,7 +1493,7 @@ if NUMBA_AVAILABLE:
                 if s == 0.0:
                     continue
                 length = branch_lengths[k]
-                sum_pow = length * s ** alpha
+                sum_pow = length * s**alpha
                 numerator += sum_pow * (d / s)
                 denominator += sum_pow
             idx = base + j
@@ -1356,7 +1501,11 @@ if NUMBA_AVAILABLE:
 
     @njit(parallel=True)
     def _generalized_unifrac_pdist_nb(
-        counts_by_node, branch_lengths, sample_totals, alpha, variance_adjust,
+        counts_by_node,
+        branch_lengths,
+        sample_totals,
+        alpha,
+        variance_adjust,
     ):
         """Full generalized UniFrac distance matrix (condensed) via Numba.
 
@@ -1411,21 +1560,41 @@ if NUMBA_AVAILABLE:
 
         for i in prange(n_half):
             _generalized_unifrac_row_nb(
-                i, n_samples, n_nodes, counts_by_node, branch_lengths,
-                sample_totals, alpha, variance_adjust, out,
+                i,
+                n_samples,
+                n_nodes,
+                counts_by_node,
+                branch_lengths,
+                sample_totals,
+                alpha,
+                variance_adjust,
+                out,
             )
             mirror_i = n_samples - i - 2
             if mirror_i != i:
                 _generalized_unifrac_row_nb(
-                    mirror_i, n_samples, n_nodes, counts_by_node, branch_lengths,
-                    sample_totals, alpha, variance_adjust, out,
+                    mirror_i,
+                    n_samples,
+                    n_nodes,
+                    counts_by_node,
+                    branch_lengths,
+                    sample_totals,
+                    alpha,
+                    variance_adjust,
+                    out,
                 )
 
         return out
 
 
 def _generalized_unifrac_pdist_numba(
-    counts, taxa, tree, alpha, variance_adjust, validate,
+    counts,
+    taxa,
+    tree,
+    *,
+    alpha=1.0,
+    variance_adjust=False,
+    validate=True,
 ):
     """Compute the condensed generalized UniFrac distance vector (Numba).
 
@@ -1433,6 +1602,9 @@ def _generalized_unifrac_pdist_numba(
     totals (reusing ``_setup_multiple_unifrac`` and ``_get_tip_indices``),
     then dispatches to the parallel Numba kernel. Returns a condensed
     distance vector consumable by ``DistanceMatrix``.
+
+    Everything after ``tree`` is keyword-only; see
+    ``_unweighted_unifrac_pdist_numba``.
 
     """
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
@@ -1446,5 +1618,9 @@ def _generalized_unifrac_pdist_numba(
     tip_indices = _get_tip_indices(tree_index)
     sample_totals = counts_by_node[:, tip_indices].sum(axis=1, dtype=np.float64)
     return _generalized_unifrac_pdist_nb(
-        counts_by_node, branch_lengths, sample_totals, alpha, variance_adjust,
+        counts_by_node,
+        branch_lengths,
+        sample_totals,
+        alpha,
+        variance_adjust,
     )

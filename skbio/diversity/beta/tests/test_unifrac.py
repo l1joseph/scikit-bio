@@ -21,6 +21,7 @@ from skbio.diversity.beta import (unweighted_unifrac, weighted_unifrac,
 from skbio.diversity.beta._unifrac import (_unweighted_unifrac,
                                            _weighted_unifrac,
                                            _weighted_unifrac_branch_correction,
+                                           _unweighted_unifrac_pdist_numba,
                                            _weighted_unifrac_pdist_numba,
                                            _generalized_unifrac_pdist_numba,
                                            NUMBA_AVAILABLE)
@@ -443,6 +444,21 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                 obs, expected[sample_ids[i], sample_ids[j]],
                 delta=SSU_FIXTURE_TOLERANCE)
 
+    def test_unweighted_unifrac_unnormalized_variance_adjust_matches_ssu_fixture(
+        self,
+    ):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture(
+            'unweighted_unnormalized_unifrac_vaw_dm.txt')
+        for i, j in [(0, 1), (2, 5), (3, 7)]:
+            obs = unweighted_unifrac(
+                table[i], table[j], taxa, tree,
+                normalized=False, variance_adjust=True,
+            )
+            self.assertAlmostEqual(
+                obs, expected[sample_ids[i], sample_ids[j]],
+                delta=SSU_FIXTURE_TOLERANCE)
+
     @skipIf(NUMBA_AVAILABLE, "numba is installed")
     def test_unweighted_unifrac_variance_adjust_requires_numba(self):
         with self.assertRaises(ImportError):
@@ -806,7 +822,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         n = table.shape[0]
         for normalized in (False, True):
             condensed = _weighted_unifrac_pdist_numba(
-                table, taxa, tree, normalized, True, variance_adjust=True,
+                table, taxa, tree, normalized=normalized,
+                variance_adjust=True, validate=True,
             )
             obs = DistanceMatrix(condensed, sample_ids)
             for i in range(n):
@@ -898,7 +915,8 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         for alpha in (0.5, 1.0):
             for variance_adjust in (False, True):
                 condensed = _generalized_unifrac_pdist_numba(
-                    table, taxa, tree, alpha, variance_adjust, True,
+                    table, taxa, tree, alpha=alpha,
+                    variance_adjust=variance_adjust, validate=True,
                 )
                 obs = DistanceMatrix(condensed, sample_ids)
                 for i in range(n):
@@ -1164,6 +1182,125 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
                     "unweighted_unifrac", self.b1, ids=self.sids1,
                     taxa=self.oids1, tree=self.t1, engine=engine,
                     bogus_kwarg=True)
+
+    # -- keyword-only signatures ---------------------------------------
+
+    def test_unifrac_options_are_keyword_only(self):
+        # Before `normalized`/`variance_adjust`/`alpha`/`engine` were added,
+        # `validate` was the last positional-or-keyword parameter, so
+        # `unweighted_unifrac(u, v, taxa, tree, False)` meant validate=False.
+        # Those options are keyword-only so such a call raises instead of
+        # silently binding False to a different parameter.
+        for func in (unweighted_unifrac, weighted_unifrac, generalized_unifrac):
+            with self.assertRaises(TypeError):
+                func(self.b1[0], self.b1[1], self.oids1, self.t1, False)
+
+    @numba_code
+    def test_unifrac_pdist_numba_options_are_keyword_only(self):
+        # The three pdist kernels took their options in three different
+        # orders, so positional calls were easy to get wrong; everything
+        # after `tree` is keyword-only now.
+        for func in (_unweighted_unifrac_pdist_numba,
+                     _weighted_unifrac_pdist_numba,
+                     _generalized_unifrac_pdist_numba):
+            with self.assertRaises(TypeError):
+                func(self.b1, self.oids1, self.t1, True)
+
+    def test_unifrac_invalid_engine_raises(self):
+        for func in (unweighted_unifrac, weighted_unifrac, generalized_unifrac):
+            for bad in ('cuda', 'GPU', 'numba', 'cython'):
+                with self.assertRaisesRegex(ValueError, 'engine'):
+                    func(self.b1[0], self.b1[1], self.oids1, self.t1,
+                         engine=bad)
+
+    # -- beta_diversity kwarg handling ---------------------------------
+
+    @numba_code
+    def test_beta_diversity_unweighted_unifrac_unnormalized(self):
+        # `normalized` must reach the unweighted_unifrac kernels rather than
+        # being dropped (gpu) or treated as an unrecognized kwarg (numba).
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
+        for engine in (None, 'cython', 'numba', 'fast'):
+            dm = beta_diversity(
+                "unweighted_unifrac", table, ids=sample_ids, taxa=taxa,
+                tree=tree, normalized=False, engine=engine)
+            self.assertAlmostEqual(
+                dm['f2', 'f1'], expected['f2', 'f1'],
+                delta=SSU_FIXTURE_TOLERANCE)
+
+    @numba_code
+    def test_beta_diversity_unweighted_unifrac_unnormalized_uses_numba(self):
+        # normalized is a kwarg the numba kernel supports, so asking for
+        # engine='numba' with it must not warn about falling back.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            beta_diversity(
+                "unweighted_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1, normalized=False,
+                engine="numba")
+        self.assertEqual(
+            [str(w.message) for w in caught if "engine=" in str(w.message)], [])
+
+    @numba_code
+    def test_beta_diversity_variance_adjust_with_pairwise_func_raises(self):
+        # There is no non-numba implementation of variance adjustment, so a
+        # pairwise_func (which forces the generic pdist path) must raise
+        # rather than silently return the plain, non-adjusted result.
+        def recording_pdist(counts, metric, **kwargs):
+            from scipy.spatial.distance import pdist
+            return pdist(counts, metric=metric, **kwargs)
+
+        for metric in ("unweighted_unifrac", "weighted_unifrac"):
+            with self.assertRaisesRegex(ValueError, "variance_adjust"):
+                beta_diversity(
+                    metric, self.b1, ids=self.sids1, taxa=self.oids1,
+                    tree=self.t1, variance_adjust=True,
+                    pairwise_func=recording_pdist)
+
+    @numba_code
+    def test_beta_diversity_generalized_unifrac_bogus_kwarg_raises(self):
+        # A typo'd alpha used to be silently ignored, computing with the
+        # default alpha instead.
+        with self.assertRaises(TypeError):
+            beta_diversity(
+                "generalized_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1, alpah=0.5)
+
+    @numba_code
+    def test_beta_diversity_generalized_unifrac_pairwise_func_raises(self):
+        # generalized_unifrac has no pairwise_func path at all, so a supplied
+        # one must raise rather than be silently ignored.
+        def not_a_real_pdist(counts, metric, **kwargs):
+            return np.zeros(counts.shape[0] * (counts.shape[0] - 1) // 2)
+
+        with self.assertRaisesRegex(ValueError, "pairwise_func"):
+            beta_diversity(
+                "generalized_unifrac", self.b1, ids=self.sids1,
+                taxa=self.oids1, tree=self.t1,
+                pairwise_func=not_a_real_pdist)
+
+    def test_beta_diversity_gpu_engine_bogus_kwarg_raises(self):
+        # Checked before GPU backend detection, so this runs with or without
+        # a GPU present.
+        for metric in ("unweighted_unifrac", "weighted_unifrac",
+                       "generalized_unifrac"):
+            with self.assertRaises(TypeError):
+                beta_diversity(
+                    metric, self.b1, ids=self.sids1, taxa=self.oids1,
+                    tree=self.t1, engine="gpu", bogus_kwarg=True)
+
+    def test_beta_diversity_gpu_engine_pairwise_func_raises(self):
+        def not_a_real_pdist(counts, metric, **kwargs):
+            return np.zeros(counts.shape[0] * (counts.shape[0] - 1) // 2)
+
+        for metric in ("unweighted_unifrac", "weighted_unifrac",
+                       "generalized_unifrac"):
+            with self.assertRaisesRegex(ValueError, "pairwise_func"):
+                beta_diversity(
+                    metric, self.b1, ids=self.sids1, taxa=self.oids1,
+                    tree=self.t1, engine="gpu",
+                    pairwise_func=not_a_real_pdist)
 
     # -- engine='gpu' wiring -------------------------------------------
     #

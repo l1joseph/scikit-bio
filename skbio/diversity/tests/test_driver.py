@@ -820,6 +820,7 @@ class MetricGetters(TestCase):
         # basic sanity checks
         self.assertTrue('unweighted_unifrac' in m)
         self.assertTrue('weighted_unifrac' in m)
+        self.assertTrue('generalized_unifrac' in m)
 
     def test_get_beta_diversity_metrics_sorted(self):
         m = get_beta_diversity_metrics()
@@ -861,6 +862,24 @@ class TestPartialBetaDiversity(TestCase):
                                         expected_dm[id1, id2], 6)
 
         # pass in iter(foo)
+
+    def test_variance_adjust_not_supported(self):
+        # partial_beta_diversity's own preprocessing already alters the
+        # abundances variance adjustment needs, and the per-pair functions it
+        # builds have no variance-adjusted form, so this must raise a clear
+        # error rather than fail downstream with a confusing TypeError.
+        for metric in ('unweighted_unifrac', 'weighted_unifrac'):
+            with self.assertRaisesRegex(ValueError, 'variance_adjust'):
+                partial_beta_diversity(
+                    metric, self.table1, self.sids1, taxa=self.oids1,
+                    tree=self.tree1, id_pairs=[('B', 'C')],
+                    variance_adjust=True)
+
+    def test_generalized_unifrac_not_supported(self):
+        with self.assertRaisesRegex(ValueError, 'only compatible with'):
+            partial_beta_diversity(
+                'generalized_unifrac', self.table1, self.sids1,
+                taxa=self.oids1, tree=self.tree1, id_pairs=[('B', 'C')])
 
     def test_unweighted_unifrac_partial(self):
         # TODO: update npt.assert_almost_equal calls to use DistanceMatrix

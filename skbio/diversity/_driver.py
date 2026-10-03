@@ -133,7 +133,11 @@ def get_beta_diversity_metrics() -> list[str]:
     SciPy's :func:`~scipy.spatial.distance.pdist` for more details.
 
     """
-    return sorted(_pdist_metrics.union(["unweighted_unifrac", "weighted_unifrac"]))
+    return sorted(
+        _pdist_metrics.union(
+            ["unweighted_unifrac", "weighted_unifrac", "generalized_unifrac"]
+        )
+    )
 
 
 def alpha_diversity(
@@ -238,23 +242,31 @@ def alpha_diversity(
 _UNIFRAC_FAST_ENGINE = "numba" if NUMBA_AVAILABLE else "cython"
 
 
-def _numba_unifrac_fast_path_eligible(engine, pairwise_func, kwargs):
-    """Whether beta_diversity's numba unifrac kernels can be used as-is.
+def _numba_unifrac_fast_path_blocker(pairwise_func, kwargs):
+    """Why beta_diversity's numba unifrac kernels can't be used, or None.
 
     Those kernels compute the whole distance matrix directly, bypassing
     pairwise_func and any leftover metric kwargs entirely, so the fast path
-    only applies when neither was supplied. Warn if the caller explicitly
-    asked for engine="numba" but can't get it, so that case stays visible
-    instead of silently falling back to the cython/pairwise_func path.
+    only applies when neither was supplied.
     """
-    if pairwise_func is None and not kwargs:
+    if pairwise_func is not None:
+        return "a pairwise_func was provided"
+    if kwargs:
+        return f"unrecognized keyword argument(s) {sorted(kwargs)} were provided"
+    return None
+
+
+def _numba_unifrac_fast_path_eligible(engine, pairwise_func, kwargs):
+    """Whether beta_diversity's numba unifrac kernels can be used as-is.
+
+    Warn if the caller explicitly asked for engine="numba" but can't get it,
+    so that case stays visible instead of silently falling back to the
+    cython/pairwise_func path.
+    """
+    reason = _numba_unifrac_fast_path_blocker(pairwise_func, kwargs)
+    if reason is None:
         return True
     if engine == "numba":
-        reason = (
-            "a pairwise_func was provided"
-            if pairwise_func is not None
-            else f"unrecognized keyword argument(s) {sorted(kwargs)} were provided"
-        )
         warnings.warn(
             f"engine='numba' was requested but {reason}, which the numba "
             "unifrac kernels cannot use; falling back to the cython/"
@@ -262,6 +274,59 @@ def _numba_unifrac_fast_path_eligible(engine, pairwise_func, kwargs):
             stacklevel=3,
         )
     return False
+
+
+def _require_numba_unifrac_fast_path(what, metric, pairwise_func, kwargs):
+    """Raise unless the numba unifrac kernels can be used.
+
+    Used for features (``variance_adjust``, ``generalized_unifrac``'s whole
+    computation) that exist only in the numba kernels, where falling through
+    to the generic pdist path would silently compute something else. ``what``
+    names the feature for the error message.
+    """
+    if _numba_unifrac_fast_path_blocker(pairwise_func, kwargs) is None:
+        return
+    if pairwise_func is not None:
+        raise ValueError(
+            f"{what} is only implemented by the numba UniFrac kernels, which "
+            "compute the whole distance matrix directly and cannot use a "
+            "pairwise_func."
+        )
+    raise TypeError(
+        f"beta_diversity got unexpected keyword argument(s) {sorted(kwargs)} "
+        f"for metric '{metric}'."
+    )
+
+
+def _reject_partial_variance_adjust(metric, kwargs):
+    """Reject variance_adjust for partial_beta_diversity's unifrac metrics.
+
+    The per-pair functions partial_beta_diversity builds have no
+    variance-adjusted form (they would fail on the missing sample totals),
+    and its upstream count qualification has already altered the abundances
+    variance adjustment is defined over, so the result would be wrong even if
+    it ran.
+    """
+    if kwargs.pop("variance_adjust", False):
+        raise ValueError(
+            f"variance_adjust is not supported by partial_beta_diversity for "
+            f"metric '{metric}'. Use beta_diversity instead."
+        )
+
+
+def _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs):
+    """Raise rather than silently ignore what the GPU path cannot honor."""
+    if kwargs:
+        raise TypeError(
+            f"beta_diversity got unexpected keyword argument(s) "
+            f"{sorted(kwargs)} for metric '{metric}'."
+        )
+    if pairwise_func is not None:
+        raise ValueError(
+            f"pairwise_func is not supported by engine='gpu' for metric "
+            f"'{metric}'; the GPU kernel computes the whole distance matrix "
+            "directly."
+        )
 
 
 def beta_diversity(
@@ -358,19 +423,27 @@ def beta_diversity(
         taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
 
     if metric == "unweighted_unifrac":
+        normalized = kwargs.pop("normalized", True)
         variance_adjust = kwargs.pop("variance_adjust", False)
         if engine == "gpu":
             from skbio.diversity.beta._unifrac_gpu import (
-                detect_gpu_backend, unweighted_unifrac_gpu,
+                detect_gpu_backend,
+                unweighted_unifrac_gpu,
             )
+
+            _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs)
             if detect_gpu_backend() is None:
                 raise ImportError(
                     "engine='gpu' was requested but no usable GPU backend "
                     "(numba-cuda or numba.hip) was found."
                 )
             distances = unweighted_unifrac_gpu(
-                counts, taxa, tree, normalized=True,
-                variance_adjust=variance_adjust, validate=validate,
+                counts,
+                taxa,
+                tree,
+                normalized=normalized,
+                variance_adjust=variance_adjust,
+                validate=validate,
             )
             return DistanceMatrix(distances, ids)
         resolved_engine = _resolve_engine(
@@ -384,17 +457,27 @@ def beta_diversity(
                 raise ImportError(
                     "variance_adjust=True for unweighted_unifrac requires numba."
                 )
+            _require_numba_unifrac_fast_path(
+                f"variance_adjust=True for metric '{metric}'",
+                metric,
+                pairwise_func,
+                kwargs,
+            )
             resolved_engine = "numba"
         if resolved_engine == "numba" and _numba_unifrac_fast_path_eligible(
             engine, pairwise_func, kwargs
         ):
             distances = _unweighted_unifrac_pdist_numba(
-                counts, taxa=taxa, tree=tree, normalized=True,
-                variance_adjust=variance_adjust, validate=validate,
+                counts,
+                taxa=taxa,
+                tree=tree,
+                normalized=normalized,
+                variance_adjust=variance_adjust,
+                validate=validate,
             )
             return DistanceMatrix(distances, ids)
         metric, counts = _setup_multiple_unweighted_unifrac(
-            counts, taxa=taxa, tree=tree, validate=validate
+            counts, taxa=taxa, tree=tree, validate=validate, normalized=normalized
         )
     elif metric == "weighted_unifrac":
         # get the value for normalized. if it was not provided, it will fall
@@ -403,16 +486,23 @@ def beta_diversity(
         variance_adjust = kwargs.pop("variance_adjust", False)
         if engine == "gpu":
             from skbio.diversity.beta._unifrac_gpu import (
-                detect_gpu_backend, weighted_unifrac_gpu,
+                detect_gpu_backend,
+                weighted_unifrac_gpu,
             )
+
+            _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs)
             if detect_gpu_backend() is None:
                 raise ImportError(
                     "engine='gpu' was requested but no usable GPU backend "
                     "(numba-cuda or numba.hip) was found."
                 )
             distances = weighted_unifrac_gpu(
-                counts, taxa, tree, normalized=normalized,
-                variance_adjust=variance_adjust, validate=validate,
+                counts,
+                taxa,
+                tree,
+                normalized=normalized,
+                variance_adjust=variance_adjust,
+                validate=validate,
             )
             return DistanceMatrix(distances, ids)
         resolved_engine = _resolve_engine(
@@ -426,6 +516,12 @@ def beta_diversity(
                 raise ImportError(
                     "variance_adjust=True for weighted_unifrac requires numba."
                 )
+            _require_numba_unifrac_fast_path(
+                f"variance_adjust=True for metric '{metric}'",
+                metric,
+                pairwise_func,
+                kwargs,
+            )
             resolved_engine = "numba"
         if resolved_engine == "numba" and _numba_unifrac_fast_path_eligible(
             engine, pairwise_func, kwargs
@@ -447,8 +543,11 @@ def beta_diversity(
         variance_adjust = kwargs.pop("variance_adjust", False)
         if engine == "gpu":
             from skbio.diversity.beta._unifrac_gpu import (
-                detect_gpu_backend, generalized_unifrac_gpu,
+                detect_gpu_backend,
+                generalized_unifrac_gpu,
             )
+
+            _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs)
             if detect_gpu_backend() is None:
                 raise ImportError(
                     "engine='gpu' was requested but no usable GPU backend "
@@ -456,17 +555,33 @@ def beta_diversity(
                 )
         elif not NUMBA_AVAILABLE:
             raise ImportError("generalized_unifrac requires numba.")
+        else:
+            # This metric has no cython/pairwise_func path at all, so anything
+            # the numba kernel cannot consume must raise rather than be
+            # silently dropped (a typo'd alpha used to compute with the
+            # default alpha, and a pairwise_func used to be ignored).
+            _require_numba_unifrac_fast_path(
+                f"metric '{metric}'", metric, pairwise_func, kwargs
+            )
         if not (0.0 <= alpha <= 1.0):
             raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
         if engine == "gpu":
             distances = generalized_unifrac_gpu(
-                counts, taxa, tree, alpha=alpha,
-                variance_adjust=variance_adjust, validate=validate,
+                counts,
+                taxa,
+                tree,
+                alpha=alpha,
+                variance_adjust=variance_adjust,
+                validate=validate,
             )
             return DistanceMatrix(distances, ids)
         distances = _generalized_unifrac_pdist_numba(
-            counts, taxa=taxa, tree=tree, alpha=alpha,
-            variance_adjust=variance_adjust, validate=validate,
+            counts,
+            taxa=taxa,
+            tree=tree,
+            alpha=alpha,
+            variance_adjust=variance_adjust,
+            validate=validate,
         )
         return DistanceMatrix(distances, ids)
     elif metric == "manhattan":
@@ -579,11 +694,13 @@ def partial_beta_diversity(
         raise ValueError("A duplicate or a self-self pair was observed.")
 
     if metric == "unweighted_unifrac":
+        _reject_partial_variance_adjust(metric, kwargs)
         taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
         func, counts = _setup_multiple_unweighted_unifrac(
             counts, taxa=taxa, tree=tree, validate=validate
         )
     elif metric == "weighted_unifrac":
+        _reject_partial_variance_adjust(metric, kwargs)
         # get the value for normalized. if it was not provided, it will fall
         # back to the default value inside of _weighted_unifrac_pdist_f
         normalized = kwargs.pop("normalized", _normalize_weighted_unifrac_by_default)
