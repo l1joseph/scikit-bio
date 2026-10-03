@@ -20,6 +20,10 @@ GENERALIZED = 4
 
 _backend_cache = None
 
+# Compiled kernels, keyed by id() of the cuda-API module they were built
+# against. The module itself is stored alongside so the id stays valid.
+_KERNEL_CACHE = {}
+
 
 def detect_gpu_backend():
     """Detect which GPU backend, if any, is usable.
@@ -37,6 +41,7 @@ def detect_gpu_backend():
         return _backend_cache
     try:
         from numba import cuda
+
         if cuda.is_available():
             _backend_cache = "cuda"
             return _backend_cache
@@ -44,6 +49,7 @@ def detect_gpu_backend():
         pass
     try:
         import numba.hip as hip
+
         if hip.is_available():
             _backend_cache = "hip"
             return _backend_cache
@@ -69,13 +75,28 @@ def get_cuda_module():
     ImportError
         If no usable GPU backend is detected.
 
+    Notes
+    -----
+    NVIDIA support comes from the ``numba-cuda`` package, installable via
+    scikit-bio's ``gpu-nvidia`` extra. AMD support requires ``numba-hip``,
+    which is published only on test.pypi and must be pinned to match the
+    installed ROCm version (for example
+    ``numba-hip[rocm-7-0-0]==0.1.6`` for ROCm 7.0.0), so there is no
+    single pip specification that works across ROCm releases and hence no
+    ``gpu-amd`` extra. Note that ``hip-python`` alone is not sufficient: it
+    provides low-level HIP bindings, not ``numba.hip``/``pose_as_cuda()``.
+    See ``docs/superpowers/specs/2026-10-02-ssu-unifrac-numba-phase1-design.md``
+    for the full install path.
+
     """
     backend = detect_gpu_backend()
     if backend == "cuda":
         from numba import cuda
+
         return cuda
     if backend == "hip":
         import numba.hip as hip
+
         hip.pose_as_cuda()
         return hip
     raise ImportError(
@@ -86,34 +107,46 @@ def get_cuda_module():
 
 
 def _build_pair_index(n_samples):
-    """Precompute condensed-index (i, j) pairs for i < j, scipy pdist order."""
-    pair_i = np.empty(n_samples * (n_samples - 1) // 2, dtype=np.int32)
-    pair_j = np.empty_like(pair_i)
-    idx = 0
-    for i in range(n_samples):
-        for j in range(i + 1, n_samples):
-            pair_i[idx] = i
-            pair_j[idx] = j
-            idx += 1
-    return pair_i, pair_j
+    """Precompute condensed-index (i, j) pairs for i < j, scipy pdist order.
+
+    ``np.triu_indices`` walks the upper triangle row by row, which is exactly
+    ``scipy.spatial.distance.pdist``'s condensed order.
+    """
+    pair_i, pair_j = np.triu_indices(n_samples, k=1)
+    return pair_i.astype(np.int32), pair_j.astype(np.int32)
 
 
 def _make_unifrac_kernel(cuda):
-    """Build the UniFrac pair kernel against the given cuda-API module.
+    """Return the UniFrac pair kernel compiled against a cuda-API module.
 
     Shared by all 5 UniFrac methods (``UNWEIGHTED``, ``UNWEIGHTED_UNNORMALIZED``,
     ``WEIGHTED_NORMALIZED``, ``WEIGHTED_UNNORMALIZED``, ``GENERALIZED``) so that
     only one kernel is compiled and launched regardless of which method a given
-    driver function dispatches. ``weighted_unifrac_gpu`` (this task) only
-    exercises the two weighted branches; the unweighted and generalized
-    branches are exercised by the driver functions added in later tasks.
+    driver function dispatches.
+
+    ``cuda.jit`` returns a fresh Dispatcher (and so pays full compilation
+    cost, seconds) each time this runs, which would otherwise happen on every
+    single ``*_unifrac_gpu`` call. The result is therefore memoized per
+    backend module in ``_KERNEL_CACHE``; only the compiled kernel object is
+    cached, never any per-call state.
 
     """
+    cached = _KERNEL_CACHE.get(id(cuda))
+    if cached is not None:
+        return cached[1]
 
     @cuda.jit
     def _unifrac_pair_kernel(
-        proportions, counts, sample_totals, branch_lengths, method, alpha,
-        variance_adjust, pair_i, pair_j, out,
+        proportions,
+        counts,
+        sample_totals,
+        branch_lengths,
+        method,
+        alpha,
+        variance_adjust,
+        pair_i,
+        pair_j,
+        out,
     ):
         idx = cuda.grid(1)
         if idx >= out.shape[0]:
@@ -155,7 +188,7 @@ def _make_unifrac_kernel(cuda):
             elif method == GENERALIZED:
                 if s == 0.0:
                     continue
-                sum_pow = length * s ** alpha
+                sum_pow = length * s**alpha
                 numerator += sum_pow * (d / s)
                 denominator += sum_pow
         if method == WEIGHTED_UNNORMALIZED or method == UNWEIGHTED_UNNORMALIZED:
@@ -163,6 +196,9 @@ def _make_unifrac_kernel(cuda):
         else:
             out[idx] = 0.0 if denominator == 0.0 else numerator / denominator
 
+    # Keep a reference to the module so its id() cannot be reused by another
+    # object while this entry lives.
+    _KERNEL_CACHE[id(cuda)] = (cuda, _unifrac_pair_kernel)
     return _unifrac_pair_kernel
 
 
@@ -178,6 +214,7 @@ def weighted_unifrac_gpu(
 
     """
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
+
     cuda = get_cuda_module()
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
@@ -187,8 +224,10 @@ def weighted_unifrac_gpu(
     sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
     n_samples = counts_by_node.shape[0]
     proportions = np.divide(
-        counts_by_node, sample_totals[:, None],
-        out=np.zeros_like(counts_by_node), where=sample_totals[:, None] > 0,
+        counts_by_node,
+        sample_totals[:, None],
+        out=np.zeros_like(counts_by_node),
+        where=sample_totals[:, None] > 0,
     )
     pair_i, pair_j = _build_pair_index(n_samples)
     n_pairs = pair_i.shape[0]
@@ -206,8 +245,16 @@ def weighted_unifrac_gpu(
     threads_per_block = 256
     blocks = (n_pairs + threads_per_block - 1) // threads_per_block
     kernel[blocks, threads_per_block](
-        d_proportions, d_counts, d_sample_totals, d_branch_lengths,
-        method, 1.0, variance_adjust, d_pair_i, d_pair_j, d_out,
+        d_proportions,
+        d_counts,
+        d_sample_totals,
+        d_branch_lengths,
+        method,
+        1.0,
+        variance_adjust,
+        d_pair_i,
+        d_pair_j,
+        d_out,
     )
     return d_out.copy_to_host()
 
@@ -225,6 +272,7 @@ def unweighted_unifrac_gpu(
 
     """
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
+
     cuda = get_cuda_module()
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
@@ -252,8 +300,16 @@ def unweighted_unifrac_gpu(
     threads_per_block = 256
     blocks = (n_pairs + threads_per_block - 1) // threads_per_block
     kernel[blocks, threads_per_block](
-        d_proportions, d_counts, d_sample_totals, d_branch_lengths,
-        method, 1.0, variance_adjust, d_pair_i, d_pair_j, d_out,
+        d_proportions,
+        d_counts,
+        d_sample_totals,
+        d_branch_lengths,
+        method,
+        1.0,
+        variance_adjust,
+        d_pair_i,
+        d_pair_j,
+        d_out,
     )
     return d_out.copy_to_host()
 
@@ -270,6 +326,7 @@ def generalized_unifrac_gpu(
 
     """
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
+
     cuda = get_cuda_module()
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
@@ -279,8 +336,10 @@ def generalized_unifrac_gpu(
     sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
     n_samples = counts_by_node.shape[0]
     proportions = np.divide(
-        counts_by_node, sample_totals[:, None],
-        out=np.zeros_like(counts_by_node), where=sample_totals[:, None] > 0,
+        counts_by_node,
+        sample_totals[:, None],
+        out=np.zeros_like(counts_by_node),
+        where=sample_totals[:, None] > 0,
     )
     pair_i, pair_j = _build_pair_index(n_samples)
     n_pairs = pair_i.shape[0]
@@ -297,7 +356,15 @@ def generalized_unifrac_gpu(
     threads_per_block = 256
     blocks = (n_pairs + threads_per_block - 1) // threads_per_block
     kernel[blocks, threads_per_block](
-        d_proportions, d_counts, d_sample_totals, d_branch_lengths,
-        GENERALIZED, alpha, variance_adjust, d_pair_i, d_pair_j, d_out,
+        d_proportions,
+        d_counts,
+        d_sample_totals,
+        d_branch_lengths,
+        GENERALIZED,
+        alpha,
+        variance_adjust,
+        d_pair_i,
+        d_pair_j,
+        d_out,
     )
     return d_out.copy_to_host()

@@ -11,7 +11,9 @@ from unittest import TestCase, main
 import numpy as np
 
 from skbio.diversity.beta._unifrac_gpu import (
+    _KERNEL_CACHE,
     _build_pair_index,
+    _make_unifrac_kernel,
     detect_gpu_backend,
     generalized_unifrac_gpu,
     get_cuda_module,
@@ -73,6 +75,38 @@ class BuildPairIndexTests(TestCase):
             self.assertEqual(pair_j.dtype, np.int32)
 
 
+class MakeUnifracKernelTests(TestCase):
+    """Kernel compilation is memoized per backend (no GPU required)."""
+
+    def _fake_cuda_module(self):
+        class FakeCuda:
+            """Stands in for numba.cuda; `jit` just returns the function."""
+
+            @staticmethod
+            def jit(func):
+                return func
+
+            @staticmethod
+            def grid(ndim):  # pragma: no cover - never called
+                return 0
+
+        return FakeCuda()
+
+    def test_kernel_is_compiled_once_per_backend(self):
+        fake = self._fake_cuda_module()
+        self.addCleanup(_KERNEL_CACHE.pop, id(fake), None)
+        first = _make_unifrac_kernel(fake)
+        second = _make_unifrac_kernel(fake)
+        self.assertIs(first, second)
+
+    def test_distinct_backends_get_distinct_kernels(self):
+        fake1 = self._fake_cuda_module()
+        fake2 = self._fake_cuda_module()
+        self.addCleanup(_KERNEL_CACHE.pop, id(fake1), None)
+        self.addCleanup(_KERNEL_CACHE.pop, id(fake2), None)
+        self.assertIsNot(_make_unifrac_kernel(fake1), _make_unifrac_kernel(fake2))
+
+
 class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
 
     def setUp(self):
@@ -100,6 +134,32 @@ class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         )
         cpu = _weighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=True, validate=True
+        )
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+
+    def test_weighted_unifrac_gpu_matches_cpu_variance_adjusted_unnormalized(self):
+        from skbio.diversity.beta._unifrac import _weighted_unifrac_pdist_numba
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        gpu = weighted_unifrac_gpu(
+            table, taxa, tree,
+            normalized=False, variance_adjust=True, validate=True,
+        )
+        cpu = _weighted_unifrac_pdist_numba(
+            table, taxa, tree,
+            normalized=False, variance_adjust=True, validate=True,
+        )
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+
+    def test_weighted_unifrac_gpu_matches_cpu_variance_adjusted_normalized(self):
+        from skbio.diversity.beta._unifrac import _weighted_unifrac_pdist_numba
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        gpu = weighted_unifrac_gpu(
+            table, taxa, tree,
+            normalized=True, variance_adjust=True, validate=True,
+        )
+        cpu = _weighted_unifrac_pdist_numba(
+            table, taxa, tree,
+            normalized=True, variance_adjust=True, validate=True,
         )
         np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
@@ -195,6 +255,17 @@ class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         )
         cpu = _generalized_unifrac_pdist_numba(
             table, taxa, tree, alpha=0.5, variance_adjust=True, validate=True
+        )
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
+
+    def test_generalized_unifrac_gpu_matches_cpu_variance_adjusted_alpha_one(self):
+        from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        gpu = generalized_unifrac_gpu(
+            table, taxa, tree, alpha=1.0, variance_adjust=True, validate=True,
+        )
+        cpu = _generalized_unifrac_pdist_numba(
+            table, taxa, tree, alpha=1.0, variance_adjust=True, validate=True
         )
         np.testing.assert_allclose(gpu, cpu, rtol=0, atol=GPU_CPU_TOLERANCE)
 
