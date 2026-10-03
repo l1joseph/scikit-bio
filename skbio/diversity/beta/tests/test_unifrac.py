@@ -781,13 +781,14 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
     def test_weighted_unifrac_variance_adjust_engine_numba_matches_single_pair(self):
         # The variance_adjust path of the numba pdist kernel
         # (_weighted_unifrac_pdist_numba / _weighted_unifrac_pdist_nb) has no
-        # cython/pairwise_func counterpart to compare against (beta_diversity
-        # does not yet wire variance_adjust through for weighted_unifrac), so
-        # cross-check it directly against the single-pair weighted_unifrac
-        # path for every pair in the tiny-test table -- that path is already
-        # validated against the SSU fixtures above, so this transitively
-        # confirms the kernel's variance_adjust branch for every pair, not
-        # just the 3 spot checks used elsewhere in this file.
+        # cython/pairwise_func counterpart to compare against, so cross-check
+        # it directly against the single-pair weighted_unifrac path for every
+        # pair in the tiny-test table -- that path is already validated
+        # against the SSU fixtures above, so this transitively confirms the
+        # kernel's variance_adjust branch for every pair, not just the 3 spot
+        # checks used elsewhere in this file. See
+        # test_beta_diversity_weighted_unifrac_variance_adjust below for the
+        # end-to-end beta_diversity coverage of this combination.
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         n = table.shape[0]
         for normalized in (False, True):
@@ -1048,6 +1049,19 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         )
         expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
         self.assertAlmostEqual(dm['f2', 'f1'], expected['f2', 'f1'], places=5)
+
+    def test_beta_diversity_weighted_unifrac_variance_adjust(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        for normalized, fname in [
+            (False, 'weighted_unifrac_vaw_dm.txt'),
+            (True, 'weighted_normalized_unifrac_vaw_dm.txt'),
+        ]:
+            dm = beta_diversity(
+                "weighted_unifrac", table, ids=sample_ids, taxa=taxa, tree=tree,
+                normalized=normalized, variance_adjust=True,
+            )
+            expected = self._load_dm_fixture(fname)
+            self.assertAlmostEqual(dm['f2', 'f1'], expected['f2', 'f1'], places=5)
 
     def test_beta_diversity_engine_invalid(self):
         with self.assertRaisesRegex(
