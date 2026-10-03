@@ -55,8 +55,17 @@ the same PR rather than all at once at the end.
   `unifrac-binaries`/`ssu` remain reference/validation tools used
   during development only (the `unifrac-bench` conda env on scratch),
   never a runtime or test-suite dependency. `numba-cuda` and
-  `numba.hip` (via `hip-python`) are new **optional** runtime
-  dependencies (GPU extras), not required for base install.
+  `numba-hip` are new **optional** runtime dependencies, not required
+  for base install. Only NVIDIA gets a pip extra (`gpu-nvidia =
+  ["numba-cuda"]`): Task 12's hardware verification established that
+  `hip-python` provides only low-level HIP bindings, **not**
+  `numba.hip`/`pose_as_cuda()`, and that the package actually needed is
+  `numba-hip`, which is published only on test.pypi and must be pinned
+  per ROCm release (e.g. `numba-hip[rocm-7-0-0]==0.1.6` for ROCm
+  7.0.0). Since there is no single honest pip specification that works
+  across ROCm versions, there is deliberately **no `gpu-amd` extra**;
+  the AMD path is documented in prose instead (in `get_cuda_module`'s
+  docstring and the CHANGELOG).
 - **Exactness.** SSU was chosen over DartUniFrac partly because SSU is
   exact where DartUniFrac is approximate. Default `fastmath=False` on
   both the GPU and CPU kernels, preserving exact IEEE-754 semantics.
@@ -148,15 +157,38 @@ matching the existing pattern in commit `94b40ae5`. The existing
 
 ### Kernel design
 
-The GPU kernel directly ports SSU's actual GPU loop shape (confirmed
-clean in the earlier feasibility research): a `(sample_block, stripe,
-sample_in_block)` grid, one output cell per thread, no atomics, no
-warp-level tricks, persistent device-resident buffers allocated once
-and reused across the whole tree traversal (`cuda.device_array`/
-`copy_to_device` once, matching SSU's `acc_create_buf`/
-`acc_update_device` lifecycle). Each thread accumulates its pair's
-distance by looping serially over a batch of tree nodes ("embeddings")
-per kernel launch, same as SSU, to bound per-launch memory.
+**As built** (this section was revised after implementation; an earlier
+draft described porting SSU's own stripe/batching loop shape, which is
+*not* what shipped):
+
+The GPU kernel is a flat 1-D grid over precomputed `(pair_i, pair_j)`
+index arrays — one thread per condensed output cell, one output cell
+per thread, no atomics, no warp-level tricks. `_build_pair_index`
+produces the two `int32` arrays via `np.triu_indices(n, k=1)`, whose
+row-major upper-triangle order is exactly
+`scipy.spatial.distance.pdist`'s condensed order, so the kernel's
+output needs no reordering. Each thread loops serially over **all**
+tree nodes in a **single** kernel launch, accumulating its pair's
+numerator and denominator. Host-side buffers (`proportions`, `counts`,
+`sample_totals`, `branch_lengths`, the two pair-index arrays, and the
+output) are uploaded per call and freed when the call returns; the
+*compiled kernel* is cached at module level (`_KERNEL_CACHE`, keyed on
+the backend module) so compilation happens once per backend per
+process rather than once per call.
+
+**Deliberately not ported: SSU's stripe/batching structure.** SSU
+splits the sample axis into blocks and the node axis into batches
+("embeddings") per launch, with persistent device buffers reused across
+launches, specifically to bound per-launch device memory. The flat
+pair-index design does not address that: its two O(n²) index arrays and
+its O(n²) output all have to be resident at once, on top of the
+O(n_samples × n_nodes) proportions and counts. **This is a known
+limitation for very large N**, not an oversight — it is the one place
+where this kernel is structurally weaker than SSU's. Deriving `(i, j)`
+from the flat index arithmetically inside the kernel would remove the
+two index arrays (but not the output), and node batching would be
+needed on top of that; both are follow-up work, explicitly out of scope
+here.
 
 One kernel body is parameterized by an integer method enum
 (`UNWEIGHTED`, `UNWEIGHTED_UNNORMALIZED`, `WEIGHTED_NORMALIZED`,
@@ -208,10 +240,19 @@ implement disk-backed output itself.
 - All three wired into `beta_diversity()`'s metric registry.
 - Engine selection: existing `engine={'cython','numba','fast'}` is
   unchanged for `unweighted_unifrac`/`weighted_unifrac`'s existing
-  behavior. A new engine value is added for GPU dispatch (exact name
-  TBD during implementation, e.g. `engine='gpu'`), vendor-agnostic —
+  behavior. GPU dispatch is `engine='gpu'` (finalized; the name was
+  listed as TBD in an earlier draft of this spec), vendor-agnostic —
   the caller never specifies CUDA vs. HIP, the runtime backend
-  detection above handles that.
+  detection above handles that. The three standalone functions accept
+  only `engine=None` or `engine='gpu'` and raise `ValueError` on
+  anything else, so a typo cannot silently fall through to the CPU
+  path.
+- All parameters after `tree` on the three public functions are
+  keyword-only. `validate` used to be the last positional-or-keyword
+  parameter, so without this a pre-existing caller writing
+  `unweighted_unifrac(u, v, taxa, tree, False)` to mean
+  `validate=False` would silently bind `False` to `normalized`
+  instead and get a ~5x different number with no error.
 
 ## Error handling
 
@@ -246,7 +287,14 @@ PR:**
 - NVIDIA: run via NRP (`kubectl`-submitted job), compare against the
   `ssu` fixtures.
 - AMD: run natively on Cosmos (`srun`, MI300A / gfx942), compare
-  against the same fixtures.
+  against the same fixtures. The AMD run needed a `ROCM_PATH`
+  environment-variable *sequencing* fix specific to Cosmos — `numba.hip`
+  must be imported with `ROCM_PATH` pointing at a shim path, then
+  `ROCM_PATH` swapped to the real ROCm installation before anything
+  touches a device; setting the real path up front, or swapping after
+  the first device touch, both fail. This cost significant effort to
+  discover and is recorded here so the next AMD run does not rediscover
+  it.
 - Both backends must independently match the fixtures within a
   measured tolerance (not assumed; measured once implemented and
   documented with the actual figure, same discipline as commit

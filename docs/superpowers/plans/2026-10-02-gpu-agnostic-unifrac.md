@@ -921,8 +921,15 @@ grep -n "\[project.optional-dependencies\]" pyproject.toml
 Add under that section (matching the file's existing style, checked via the grep above):
 ```toml
 gpu-nvidia = ["numba-cuda"]
-gpu-amd = ["hip-python"]
 ```
+
+**Corrected after Task 12's hardware verification:** do *not* add a
+`gpu-amd` extra. `hip-python` provides only low-level HIP bindings, not
+`numba.hip`/`pose_as_cuda()`; the package actually needed is `numba-hip`,
+published only on test.pypi and pinned per ROCm release (e.g.
+`numba-hip[rocm-7-0-0]==0.1.6`), so no single pip specification works
+across ROCm versions. The AMD install path is documented in prose in
+`get_cuda_module`'s docstring, the spec, and the CHANGELOG instead.
 
 - [ ] **Step 6: Commit**
 
