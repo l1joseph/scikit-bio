@@ -13,6 +13,7 @@ import numpy as np
 from skbio.diversity.beta._unifrac_gpu import (
     _build_pair_index,
     detect_gpu_backend,
+    generalized_unifrac_gpu,
     get_cuda_module,
     unweighted_unifrac_gpu,
     weighted_unifrac_gpu,
@@ -122,6 +123,46 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
         )
         cpu = _unweighted_unifrac_pdist_numba(
             table, taxa, tree, normalized=True, variance_adjust=False, validate=True
+        )
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+
+
+class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
+
+    def setUp(self):
+        if detect_gpu_backend() is None:
+            self.skipTest("no GPU backend available")
+
+    def test_generalized_unifrac_gpu_matches_cpu_alpha_half(self):
+        from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        gpu = generalized_unifrac_gpu(
+            table, taxa, tree, alpha=0.5, variance_adjust=False, validate=True,
+        )
+        cpu = _generalized_unifrac_pdist_numba(
+            table, taxa, tree, alpha=0.5, variance_adjust=False, validate=True
+        )
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+
+    def test_generalized_unifrac_gpu_matches_cpu_alpha_one(self):
+        from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        gpu = generalized_unifrac_gpu(
+            table, taxa, tree, alpha=1.0, variance_adjust=False, validate=True,
+        )
+        cpu = _generalized_unifrac_pdist_numba(
+            table, taxa, tree, alpha=1.0, variance_adjust=False, validate=True
+        )
+        np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
+
+    def test_generalized_unifrac_gpu_matches_cpu_variance_adjusted(self):
+        from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        gpu = generalized_unifrac_gpu(
+            table, taxa, tree, alpha=0.5, variance_adjust=True, validate=True,
+        )
+        cpu = _generalized_unifrac_pdist_numba(
+            table, taxa, tree, alpha=0.5, variance_adjust=True, validate=True
         )
         np.testing.assert_allclose(gpu, cpu, rtol=0, atol=1e-10)
 

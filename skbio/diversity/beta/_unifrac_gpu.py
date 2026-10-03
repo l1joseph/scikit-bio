@@ -252,3 +252,48 @@ def unweighted_unifrac_gpu(
         method, 1.0, variance_adjust, d_pair_i, d_pair_j, d_out,
     )
     return d_out.copy_to_host()
+
+
+def generalized_unifrac_gpu(
+    counts, taxa, tree, alpha, variance_adjust=False, validate=True
+):
+    """Compute the condensed generalized UniFrac distance vector on a GPU.
+
+    Host-side driver for the generalized UniFrac method (``GENERALIZED``),
+    built on the shared ``_make_unifrac_kernel`` pair kernel and
+    ``_build_pair_index`` helper. Requires a GPU backend detected by
+    ``detect_gpu_backend``.
+
+    """
+    from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
+    cuda = get_cuda_module()
+    counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
+        counts, taxa, tree, validate
+    )
+    counts_by_node = np.ascontiguousarray(counts_by_node, dtype=np.float64)
+    tip_indices = _get_tip_indices(tree_index)
+    sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
+    n_samples = counts_by_node.shape[0]
+    proportions = np.divide(
+        counts_by_node, sample_totals[:, None],
+        out=np.zeros_like(counts_by_node), where=sample_totals[:, None] > 0,
+    )
+    pair_i, pair_j = _build_pair_index(n_samples)
+    n_pairs = pair_i.shape[0]
+
+    d_proportions = cuda.to_device(proportions)
+    d_counts = cuda.to_device(counts_by_node)
+    d_sample_totals = cuda.to_device(sample_totals)
+    d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
+    d_pair_i = cuda.to_device(pair_i)
+    d_pair_j = cuda.to_device(pair_j)
+    d_out = cuda.device_array(n_pairs, dtype=np.float64)
+
+    kernel = _make_unifrac_kernel(cuda)
+    threads_per_block = 256
+    blocks = (n_pairs + threads_per_block - 1) // threads_per_block
+    kernel[blocks, threads_per_block](
+        d_proportions, d_counts, d_sample_totals, d_branch_lengths,
+        GENERALIZED, alpha, variance_adjust, d_pair_i, d_pair_j, d_out,
+    )
+    return d_out.copy_to_host()
