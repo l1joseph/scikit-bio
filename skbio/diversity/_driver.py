@@ -25,6 +25,7 @@ from skbio.diversity.beta._unifrac import (
     _normalize_weighted_unifrac_by_default,
     _unweighted_unifrac_pdist_numba,
     _weighted_unifrac_pdist_numba,
+    _generalized_unifrac_pdist_numba,
     NUMBA_AVAILABLE,
 )
 from skbio.stats.distance import DistanceMatrix
@@ -342,20 +343,36 @@ def beta_diversity(
         return DistanceMatrix(np.zeros((len(ids), len(ids))), ids)
     if validate:
         counts = _validate_counts_matrix(counts)
-    if metric in _qualitative_metrics:
+    if metric in _qualitative_metrics and not (
+        metric == "unweighted_unifrac" and kwargs.get("variance_adjust")
+    ):
+        # variance_adjust needs the real abundances (sample/node totals), so
+        # skip the presence/absence qualification that the plain (non-VAW)
+        # unweighted UniFrac metric would otherwise get here.
         counts = _qualify_counts(counts)
-    if metric in ("unweighted_unifrac", "weighted_unifrac"):
+    if metric in ("unweighted_unifrac", "weighted_unifrac", "generalized_unifrac"):
         taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
 
     if metric == "unweighted_unifrac":
+        variance_adjust = kwargs.pop("variance_adjust", False)
         resolved_engine = _resolve_engine(
             engine, ("cython", "numba"), fast=_UNIFRAC_FAST_ENGINE
         )
+        if variance_adjust:
+            # variance_adjust has no cython implementation (see
+            # unweighted_unifrac), so it always needs the numba kernel,
+            # regardless of what the cython/numba/fast engine resolved to.
+            if not NUMBA_AVAILABLE:
+                raise ImportError(
+                    "variance_adjust=True for unweighted_unifrac requires numba."
+                )
+            resolved_engine = "numba"
         if resolved_engine == "numba" and _numba_unifrac_fast_path_eligible(
             engine, pairwise_func, kwargs
         ):
             distances = _unweighted_unifrac_pdist_numba(
-                counts, taxa=taxa, tree=tree, validate=validate
+                counts, taxa=taxa, tree=tree, normalized=True,
+                variance_adjust=variance_adjust, validate=validate,
             )
             return DistanceMatrix(distances, ids)
         metric, counts = _setup_multiple_unweighted_unifrac(
@@ -365,9 +382,19 @@ def beta_diversity(
         # get the value for normalized. if it was not provided, it will fall
         # back to the default value inside of _weighted_unifrac_pdist_f
         normalized = kwargs.pop("normalized", _normalize_weighted_unifrac_by_default)
+        variance_adjust = kwargs.pop("variance_adjust", False)
         resolved_engine = _resolve_engine(
             engine, ("cython", "numba"), fast=_UNIFRAC_FAST_ENGINE
         )
+        if variance_adjust:
+            # variance_adjust has no cython implementation (see
+            # weighted_unifrac), so it always needs the numba kernel,
+            # regardless of what the cython/numba/fast engine resolved to.
+            if not NUMBA_AVAILABLE:
+                raise ImportError(
+                    "variance_adjust=True for weighted_unifrac requires numba."
+                )
+            resolved_engine = "numba"
         if resolved_engine == "numba" and _numba_unifrac_fast_path_eligible(
             engine, pairwise_func, kwargs
         ):
@@ -376,12 +403,25 @@ def beta_diversity(
                 taxa=taxa,
                 tree=tree,
                 normalized=normalized,
+                variance_adjust=variance_adjust,
                 validate=validate,
             )
             return DistanceMatrix(distances, ids)
         metric, counts = _setup_multiple_weighted_unifrac(
             counts, taxa=taxa, tree=tree, normalized=normalized, validate=validate
         )
+    elif metric == "generalized_unifrac":
+        if not NUMBA_AVAILABLE:
+            raise ImportError("generalized_unifrac requires numba.")
+        alpha = kwargs.pop("alpha", 1.0)
+        variance_adjust = kwargs.pop("variance_adjust", False)
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+        distances = _generalized_unifrac_pdist_numba(
+            counts, taxa=taxa, tree=tree, alpha=alpha,
+            variance_adjust=variance_adjust, validate=validate,
+        )
+        return DistanceMatrix(distances, ids)
     elif metric == "manhattan":
         metric = "cityblock"
     elif metric == "mahalanobis":

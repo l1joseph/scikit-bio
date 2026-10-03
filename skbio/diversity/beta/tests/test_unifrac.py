@@ -1029,6 +1029,26 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         self.assertEqual(dm_nb.shape, (1, 1))
         self.assertEqual(dm_nb.data[0, 0], 0.0)
 
+    def test_beta_diversity_generalized_unifrac(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        dm = beta_diversity(
+            "generalized_unifrac", table, ids=sample_ids, taxa=taxa, tree=tree,
+            alpha=0.5,
+        )
+        expected = self._load_dm_fixture('generalized_unifrac_alpha0.5_dm.txt')
+        self.assertAlmostEqual(
+            dm['f2', 'f1'], expected['f2', 'f1'], places=5
+        )
+
+    def test_beta_diversity_unweighted_unifrac_variance_adjust(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        dm = beta_diversity(
+            "unweighted_unifrac", table, ids=sample_ids, taxa=taxa, tree=tree,
+            variance_adjust=True,
+        )
+        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
+        self.assertAlmostEqual(dm['f2', 'f1'], expected['f2', 'f1'], places=5)
+
     def test_beta_diversity_engine_invalid(self):
         with self.assertRaisesRegex(
                 ValueError, "engine='julia' is not supported"):
