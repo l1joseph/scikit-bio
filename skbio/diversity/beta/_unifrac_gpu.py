@@ -20,19 +20,49 @@ WEIGHTED_UNNORMALIZED = 3
 GENERALIZED = 4
 
 # Block-tiling parameters for the 2D node-chunked kernel (see
-# `_make_unifrac_kernel`). Chosen empirically on AMD MI300A (gfx942) at
-# n_samples=5000 (~12.5M pairs) against 2 other combinations:
-#   TILE=16, NODE_CHUNK=64:  median 1.325s
-#   TILE=32, NODE_CHUNK=32:  median 0.952s  <- winner
-#   TILE=16, NODE_CHUNK=128: fails to compile -- "local memory (66560)
-#       exceeds limit (65536)" (4 shared tiles of TILE*NODE_CHUNK float64
-#       = 16*128*8 = 16KB each = 64KB, right at AMD's 64KB LDS/block limit
-#       and pushed over by other locals).
-# (TILE=32, NODE_CHUNK=32) uses 4 * 32*32*8 bytes = 32KB of shared memory
-# per block, well under the 64KB limit, with 1024 threads/block (the max
-# on both AMD and NVIDIA).
-TILE = 32
-NODE_CHUNK = 32
+# `_make_unifrac_kernel`). A block is (TILE, TILE) threads, i.e. TILE**2
+# threads/block. These are backend-specific, not a single global constant,
+# because the same kernel source hits different hardware limits on each
+# backend at 1024 threads/block (TILE=32):
+#
+# - AMD/ROCm (``hip``): TILE=32, NODE_CHUNK=32 was chosen empirically on
+#   AMD MI300A (gfx942) at n_samples=5000 (~12.5M pairs) against 2 other
+#   combinations:
+#     TILE=16, NODE_CHUNK=64:  median 1.325s
+#     TILE=32, NODE_CHUNK=32:  median 0.952s  <- winner
+#     TILE=16, NODE_CHUNK=128: fails to compile -- "local memory (66560)
+#         exceeds limit (65536)" (4 shared tiles of TILE*NODE_CHUNK
+#         float64 = 16*128*8 = 16KB each = 64KB, right at AMD's 64KB
+#         LDS/block limit and pushed over by other locals).
+#   (TILE=32, NODE_CHUNK=32) uses 4 * 32*32*8 bytes = 32KB of shared
+#   memory per block, well under the 64KB limit, with 1024 threads/block
+#   (the max on both AMD and NVIDIA).
+# - NVIDIA/CUDA (``cuda``): a 1024-thread block (TILE=32) crashes at
+#   kernel launch with ``CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`` on every
+#   NVIDIA GPU tested (RTX 2080 Ti/Turing, A10/Ampere) -- this kernel's
+#   numba-cuda/NVVM compilation uses more registers/thread than fit
+#   NVIDIA's per-SM register budget at 1024 threads/block, even though
+#   the identical source is fine on AMD's CU register file. TILE=16
+#   (256 threads/block) launches and runs correctly on both NVIDIA cards
+#   tested; it is the smallest-change fix (same shared-memory kernel,
+#   smaller block) rather than a separate code path.
+_TILE_CONFIG = {
+    "hip": (32, 32),
+    "cuda": (16, 32),
+}
+_DEFAULT_TILE_CONFIG = (32, 32)
+
+
+def _get_tile_config(backend):
+    """Return the (TILE, NODE_CHUNK) pair tuned for ``backend``.
+
+    Falls back to the AMD-tuned default for an unrecognized backend string
+    rather than raising, since the only way to reach kernel code at all is
+    via ``get_cuda_module()``, which already restricts ``backend`` to
+    ``'cuda'``/``'hip'``.
+    """
+    return _TILE_CONFIG.get(backend, _DEFAULT_TILE_CONFIG)
+
 
 _backend_cache = None
 
@@ -145,7 +175,7 @@ def _build_block_pair_index(n_samples, tile):
     return block_i.astype(np.int32), block_j.astype(np.int32)
 
 
-def _make_unifrac_kernel(cuda):
+def _make_unifrac_kernel(cuda, tile, node_chunk):
     """Return the UniFrac pair kernel compiled against a cuda-API module.
 
     Shared by all 5 UniFrac methods (``UNWEIGHTED``, ``UNWEIGHTED_UNNORMALIZED``,
@@ -153,16 +183,23 @@ def _make_unifrac_kernel(cuda):
     only one kernel is compiled and launched regardless of which method a given
     driver function dispatches.
 
+    ``tile``/``node_chunk`` (see ``_get_tile_config``) are closed over as
+    compile-time constants, since the two backends need different values.
+
     ``cuda.jit`` returns a fresh Dispatcher (and so pays full compilation
     cost, seconds) each time this runs, which would otherwise happen on every
     single ``*_unifrac_gpu`` call. The result is therefore memoized per
-    backend module in ``_KERNEL_CACHE``; only the compiled kernel object is
-    cached, never any per-call state.
+    backend module (and tile config) in ``_KERNEL_CACHE``; only the compiled
+    kernel object is cached, never any per-call state.
 
     """
-    cached = _KERNEL_CACHE.get(id(cuda))
+    cache_key = (id(cuda), tile, node_chunk)
+    cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached[1]
+
+    TILE = tile
+    NODE_CHUNK = node_chunk
 
     @cuda.jit
     def _unifrac_block_kernel(
@@ -292,7 +329,7 @@ def _make_unifrac_kernel(cuda):
 
     # Keep a reference to the module so its id() cannot be reused by another
     # object while this entry lives.
-    _KERNEL_CACHE[id(cuda)] = (cuda, _unifrac_block_kernel)
+    _KERNEL_CACHE[cache_key] = (cuda, _unifrac_block_kernel)
     return _unifrac_block_kernel
 
 
@@ -310,6 +347,7 @@ def weighted_unifrac_gpu(
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
 
     cuda = get_cuda_module()
+    tile, node_chunk = _get_tile_config(detect_gpu_backend())
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
     )
@@ -324,7 +362,7 @@ def weighted_unifrac_gpu(
         where=sample_totals[:, None] > 0,
     )
     n_pairs = n_samples * (n_samples - 1) // 2
-    block_i, block_j = _build_block_pair_index(n_samples, TILE)
+    block_i, block_j = _build_block_pair_index(n_samples, tile)
 
     d_proportions = cuda.to_device(proportions)
     d_counts = cuda.to_device(counts_by_node)
@@ -335,8 +373,8 @@ def weighted_unifrac_gpu(
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
     method = WEIGHTED_NORMALIZED if normalized else WEIGHTED_UNNORMALIZED
-    kernel = _make_unifrac_kernel(cuda)
-    kernel[block_i.shape[0], (TILE, TILE)](
+    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
+    kernel[block_i.shape[0], (tile, tile)](
         d_proportions,
         d_counts,
         d_sample_totals,
@@ -367,6 +405,7 @@ def unweighted_unifrac_gpu(
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
 
     cuda = get_cuda_module()
+    tile, node_chunk = _get_tile_config(detect_gpu_backend())
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
     )
@@ -378,7 +417,7 @@ def unweighted_unifrac_gpu(
     # absence), so raw counts can be passed directly in place of proportions,
     # no division needed.
     n_pairs = n_samples * (n_samples - 1) // 2
-    block_i, block_j = _build_block_pair_index(n_samples, TILE)
+    block_i, block_j = _build_block_pair_index(n_samples, tile)
 
     d_proportions = cuda.to_device(counts_by_node)
     d_counts = cuda.to_device(counts_by_node)
@@ -389,8 +428,8 @@ def unweighted_unifrac_gpu(
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
     method = UNWEIGHTED if normalized else UNWEIGHTED_UNNORMALIZED
-    kernel = _make_unifrac_kernel(cuda)
-    kernel[block_i.shape[0], (TILE, TILE)](
+    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
+    kernel[block_i.shape[0], (tile, tile)](
         d_proportions,
         d_counts,
         d_sample_totals,
@@ -420,6 +459,7 @@ def generalized_unifrac_gpu(
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
 
     cuda = get_cuda_module()
+    tile, node_chunk = _get_tile_config(detect_gpu_backend())
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
     )
@@ -434,7 +474,7 @@ def generalized_unifrac_gpu(
         where=sample_totals[:, None] > 0,
     )
     n_pairs = n_samples * (n_samples - 1) // 2
-    block_i, block_j = _build_block_pair_index(n_samples, TILE)
+    block_i, block_j = _build_block_pair_index(n_samples, tile)
 
     d_proportions = cuda.to_device(proportions)
     d_counts = cuda.to_device(counts_by_node)
@@ -444,8 +484,8 @@ def generalized_unifrac_gpu(
     d_block_j = cuda.to_device(block_j)
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
-    kernel = _make_unifrac_kernel(cuda)
-    kernel[block_i.shape[0], (TILE, TILE)](
+    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
+    kernel[block_i.shape[0], (tile, tile)](
         d_proportions,
         d_counts,
         d_sample_totals,
