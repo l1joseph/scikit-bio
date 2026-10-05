@@ -9,6 +9,7 @@
 """GPU backend detection for UniFrac (:mod:`skbio.diversity.beta._unifrac_gpu`)."""
 
 import math
+from warnings import warn
 
 import numpy as np
 from numba import float64
@@ -499,3 +500,134 @@ def generalized_unifrac_gpu(
         d_out,
     )
     return d_out.copy_to_host()
+
+
+# -----------------------------------------------------------------------------
+# Two-tier dispatch: fused GPU kernel when usable, array-API fallback otherwise
+# -----------------------------------------------------------------------------
+#
+# The three driver functions above require a real, detected GPU backend
+# (``get_cuda_module`` raises ``ImportError`` otherwise) and are left exactly
+# as-is: they already run correctly on real NVIDIA/AMD hardware, including
+# proactively moving plain NumPy input onto the device for the fused-kernel
+# speedup. The wrappers below add the fallback: when no GPU backend is
+# detected, or when the fused kernel fails to build/run on the running stack,
+# they run the array-API-generic implementation in
+# :mod:`skbio.diversity.beta._unifrac_xp` instead, which is correct (if
+# slower) on any array-API backend, including plain NumPy on CPU.
+
+# Backends ('cuda'/'hip') whose fused kernel failed to build or run in this
+# process. Populated by `_mark_backend_unavailable` so later calls skip
+# straight to the array-API path instead of retrying a failing kernel.
+# (`skbio.stats.distance._gpu._mark_gpu_unavailable` is the PERMANOVA/Mantel
+# precedent for this, but it keys off an array-API array's device/backend;
+# UniFrac's GPU dispatch is keyed off `detect_gpu_backend()`'s backend name
+# instead -- plain NumPy input has no device of its own -- so a small
+# UniFrac-local equivalent is used here rather than reusing that helper.)
+_unavailable_backends = set()
+
+
+def _mark_backend_unavailable(backend):
+    """Record that ``backend``'s fused UniFrac kernel cannot run this process.
+
+    Called when the fused kernel raises after a GPU backend was detected
+    (for example a numba-hip build that fails to compile on the running ROCm
+    stack). Warns once per backend, then routes that backend to the
+    array-API fallback from then on.
+    """
+    if backend not in _unavailable_backends:
+        _unavailable_backends.add(backend)
+        warn(
+            f"The fused UniFrac GPU kernel could not be used for the "
+            f"'{backend}' backend on this system; using the array-API "
+            "fallback instead.",
+            UserWarning,
+        )
+
+
+def _usable_gpu_backend():
+    """Return `detect_gpu_backend()`'s result, unless its kernel already failed."""
+    backend = detect_gpu_backend()
+    if backend in _unavailable_backends:
+        return None
+    return backend
+
+
+def weighted_unifrac_gpu_or_xp(
+    counts, taxa, tree, normalized, variance_adjust=False, validate=True
+):
+    """Compute weighted UniFrac, preferring the fused GPU kernel when usable.
+
+    Runs :func:`weighted_unifrac_gpu` when a GPU backend is detected and its
+    fused kernel builds/runs successfully; otherwise falls back to
+    :func:`skbio.diversity.beta._unifrac_xp.weighted_unifrac_xp`, which is
+    correct (if slower) on any array-API backend, including plain NumPy.
+
+    """
+    backend = _usable_gpu_backend()
+    if backend is not None:
+        try:
+            return weighted_unifrac_gpu(
+                counts, taxa, tree, normalized,
+                variance_adjust=variance_adjust, validate=validate,
+            )
+        except Exception:
+            _mark_backend_unavailable(backend)
+    from skbio.diversity.beta._unifrac_xp import weighted_unifrac_xp
+
+    return weighted_unifrac_xp(
+        counts, taxa, tree, normalized,
+        variance_adjust=variance_adjust, validate=validate,
+    )
+
+
+def unweighted_unifrac_gpu_or_xp(
+    counts, taxa, tree, normalized, variance_adjust=False, validate=True
+):
+    """Compute unweighted UniFrac, preferring the fused GPU kernel when usable.
+
+    See :func:`weighted_unifrac_gpu_or_xp`; falls back to
+    :func:`skbio.diversity.beta._unifrac_xp.unweighted_unifrac_xp`.
+
+    """
+    backend = _usable_gpu_backend()
+    if backend is not None:
+        try:
+            return unweighted_unifrac_gpu(
+                counts, taxa, tree, normalized,
+                variance_adjust=variance_adjust, validate=validate,
+            )
+        except Exception:
+            _mark_backend_unavailable(backend)
+    from skbio.diversity.beta._unifrac_xp import unweighted_unifrac_xp
+
+    return unweighted_unifrac_xp(
+        counts, taxa, tree, normalized,
+        variance_adjust=variance_adjust, validate=validate,
+    )
+
+
+def generalized_unifrac_gpu_or_xp(
+    counts, taxa, tree, alpha, variance_adjust=False, validate=True
+):
+    """Compute generalized UniFrac, preferring the fused GPU kernel when usable.
+
+    See :func:`weighted_unifrac_gpu_or_xp`; falls back to
+    :func:`skbio.diversity.beta._unifrac_xp.generalized_unifrac_xp`.
+
+    """
+    backend = _usable_gpu_backend()
+    if backend is not None:
+        try:
+            return generalized_unifrac_gpu(
+                counts, taxa, tree, alpha,
+                variance_adjust=variance_adjust, validate=validate,
+            )
+        except Exception:
+            _mark_backend_unavailable(backend)
+    from skbio.diversity.beta._unifrac_xp import generalized_unifrac_xp
+
+    return generalized_unifrac_xp(
+        counts, taxa, tree, alpha,
+        variance_adjust=variance_adjust, validate=validate,
+    )

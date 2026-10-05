@@ -346,10 +346,11 @@ def beta_diversity(
         'generalized_unifrac'. Ignored for other metrics. If None (default),
         use the global ``compute_engine`` setting. 'fast' selects Numba if
         installed, otherwise Cython. 'gpu' dispatches to a GPU-accelerated
-        implementation, raising ``ImportError`` if no usable GPU backend
-        (``numba-cuda`` or ``numba.hip``) is detected; unlike 'fast', 'gpu'
-        is never selected automatically. See :ref:`compute_engines` for
-        details.
+        implementation: a fused kernel when a usable GPU backend
+        (``numba-cuda`` or ``numba.hip``) is detected, otherwise an
+        array-API-generic implementation that runs on the CPU; unlike
+        'fast', 'gpu' is never selected automatically. See
+        :ref:`compute_engines` for details.
 
         .. versionadded:: 0.7.4
     kwargs : dict, optional
@@ -405,17 +406,11 @@ def beta_diversity(
         variance_adjust = kwargs.pop("variance_adjust", False)
         if engine == "gpu":
             from skbio.diversity.beta._unifrac_gpu import (
-                detect_gpu_backend,
-                unweighted_unifrac_gpu,
+                unweighted_unifrac_gpu_or_xp,
             )
 
             _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs)
-            if detect_gpu_backend() is None:
-                raise ImportError(
-                    "engine='gpu' was requested but no usable GPU backend "
-                    "(numba-cuda or numba.hip) was found."
-                )
-            distances = unweighted_unifrac_gpu(
+            distances = unweighted_unifrac_gpu_or_xp(
                 counts,
                 taxa,
                 tree,
@@ -456,17 +451,11 @@ def beta_diversity(
         variance_adjust = kwargs.pop("variance_adjust", False)
         if engine == "gpu":
             from skbio.diversity.beta._unifrac_gpu import (
-                detect_gpu_backend,
-                weighted_unifrac_gpu,
+                weighted_unifrac_gpu_or_xp,
             )
 
             _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs)
-            if detect_gpu_backend() is None:
-                raise ImportError(
-                    "engine='gpu' was requested but no usable GPU backend "
-                    "(numba-cuda or numba.hip) was found."
-                )
-            distances = weighted_unifrac_gpu(
+            distances = weighted_unifrac_gpu_or_xp(
                 counts,
                 taxa,
                 tree,
@@ -513,19 +502,13 @@ def beta_diversity(
                 "'gpu'). CPU support is planned for a future release."
             )
         from skbio.diversity.beta._unifrac_gpu import (
-            detect_gpu_backend,
-            generalized_unifrac_gpu,
+            generalized_unifrac_gpu_or_xp,
         )
 
         _reject_unusable_gpu_kwargs(metric, pairwise_func, kwargs)
-        if detect_gpu_backend() is None:
-            raise ImportError(
-                "engine='gpu' was requested but no usable GPU backend "
-                "(numba-cuda or numba.hip) was found."
-            )
         if not (0.0 <= alpha <= 1.0):
             raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
-        distances = generalized_unifrac_gpu(
+        distances = generalized_unifrac_gpu_or_xp(
             counts,
             taxa,
             tree,
