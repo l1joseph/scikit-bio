@@ -14,6 +14,7 @@ from skbio import DistanceMatrix
 from skbio.diversity.beta._unifrac_gpu import (
     _KERNEL_CACHE,
     _build_pair_index,
+    _get_tile_config,
     _make_unifrac_kernel,
     detect_gpu_backend,
     generalized_unifrac_gpu,
@@ -86,6 +87,28 @@ class BuildPairIndexTests(TestCase):
             self.assertEqual(pair_j.dtype, np.int32)
 
 
+class GetTileConfigTests(TestCase):
+    """`_get_tile_config` picks the right (TILE, NODE_CHUNK) per backend.
+
+    AMD's 1024-thread block (32, 32) crashes at launch on NVIDIA with
+    CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (register budget), so the two
+    backends must not resolve to the same config.
+    """
+
+    def test_hip_keeps_the_amd_tuned_config(self):
+        self.assertEqual(_get_tile_config("hip"), (32, 32))
+
+    def test_cuda_uses_a_smaller_block(self):
+        tile, _ = _get_tile_config("cuda")
+        self.assertLess(tile, 32)
+
+    def test_hip_and_cuda_configs_differ(self):
+        self.assertNotEqual(_get_tile_config("hip"), _get_tile_config("cuda"))
+
+    def test_unrecognized_backend_falls_back_to_amd_default(self):
+        self.assertEqual(_get_tile_config("bogus"), (32, 32))
+
+
 class MakeUnifracKernelTests(TestCase):
     """Kernel compilation is memoized per backend (no GPU required)."""
 
@@ -105,17 +128,28 @@ class MakeUnifracKernelTests(TestCase):
 
     def test_kernel_is_compiled_once_per_backend(self):
         fake = self._fake_cuda_module()
-        self.addCleanup(_KERNEL_CACHE.pop, id(fake), None)
-        first = _make_unifrac_kernel(fake)
-        second = _make_unifrac_kernel(fake)
+        cache_key = (id(fake), 32, 32)
+        self.addCleanup(_KERNEL_CACHE.pop, cache_key, None)
+        first = _make_unifrac_kernel(fake, 32, 32)
+        second = _make_unifrac_kernel(fake, 32, 32)
         self.assertIs(first, second)
 
     def test_distinct_backends_get_distinct_kernels(self):
         fake1 = self._fake_cuda_module()
         fake2 = self._fake_cuda_module()
-        self.addCleanup(_KERNEL_CACHE.pop, id(fake1), None)
-        self.addCleanup(_KERNEL_CACHE.pop, id(fake2), None)
-        self.assertIsNot(_make_unifrac_kernel(fake1), _make_unifrac_kernel(fake2))
+        self.addCleanup(_KERNEL_CACHE.pop, (id(fake1), 32, 32), None)
+        self.addCleanup(_KERNEL_CACHE.pop, (id(fake2), 32, 32), None)
+        self.assertIsNot(
+            _make_unifrac_kernel(fake1, 32, 32), _make_unifrac_kernel(fake2, 32, 32)
+        )
+
+    def test_distinct_tile_configs_get_distinct_kernels(self):
+        fake = self._fake_cuda_module()
+        self.addCleanup(_KERNEL_CACHE.pop, (id(fake), 32, 32), None)
+        self.addCleanup(_KERNEL_CACHE.pop, (id(fake), 16, 32), None)
+        self.assertIsNot(
+            _make_unifrac_kernel(fake, 32, 32), _make_unifrac_kernel(fake, 16, 32)
+        )
 
 
 class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
