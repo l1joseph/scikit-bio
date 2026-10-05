@@ -11,12 +11,28 @@
 import math
 
 import numpy as np
+from numba import float64
 
 UNWEIGHTED = 0
 UNWEIGHTED_UNNORMALIZED = 1
 WEIGHTED_NORMALIZED = 2
 WEIGHTED_UNNORMALIZED = 3
 GENERALIZED = 4
+
+# Block-tiling parameters for the 2D node-chunked kernel (see
+# `_make_unifrac_kernel`). Chosen empirically on AMD MI300A (gfx942) at
+# n_samples=5000 (~12.5M pairs) against 2 other combinations:
+#   TILE=16, NODE_CHUNK=64:  median 1.325s
+#   TILE=32, NODE_CHUNK=32:  median 0.952s  <- winner
+#   TILE=16, NODE_CHUNK=128: fails to compile -- "local memory (66560)
+#       exceeds limit (65536)" (4 shared tiles of TILE*NODE_CHUNK float64
+#       = 16*128*8 = 16KB each = 64KB, right at AMD's 64KB LDS/block limit
+#       and pushed over by other locals).
+# (TILE=32, NODE_CHUNK=32) uses 4 * 32*32*8 bytes = 32KB of shared memory
+# per block, well under the 64KB limit, with 1024 threads/block (the max
+# on both AMD and NVIDIA).
+TILE = 32
+NODE_CHUNK = 32
 
 _backend_cache = None
 
@@ -116,6 +132,19 @@ def _build_pair_index(n_samples):
     return pair_i.astype(np.int32), pair_j.astype(np.int32)
 
 
+def _build_block_pair_index(n_samples, tile):
+    """Precompute (block_i, block_j) pairs of TILE x TILE sample blocks.
+
+    Unlike `_build_pair_index`, diagonal blocks (``block_i == block_j``) are
+    included (``k=0``, not ``k=1``): a diagonal block still contains valid
+    ``i < j`` pairs within itself (just not the whole block), so it cannot be
+    skipped the way a fully lower-triangle block can.
+    """
+    num_blocks = (n_samples + tile - 1) // tile
+    block_i, block_j = np.triu_indices(num_blocks, k=0)
+    return block_i.astype(np.int32), block_j.astype(np.int32)
+
+
 def _make_unifrac_kernel(cuda):
     """Return the UniFrac pair kernel compiled against a cuda-API module.
 
@@ -136,7 +165,7 @@ def _make_unifrac_kernel(cuda):
         return cached[1]
 
     @cuda.jit
-    def _unifrac_pair_kernel(
+    def _unifrac_block_kernel(
         proportions,
         counts,
         sample_totals,
@@ -144,62 +173,127 @@ def _make_unifrac_kernel(cuda):
         method,
         alpha,
         variance_adjust,
-        pair_i,
-        pair_j,
+        block_i,
+        block_j,
+        n_samples,
         out,
     ):
-        idx = cuda.grid(1)
-        if idx >= out.shape[0]:
+        blk = cuda.blockIdx.x
+        if blk >= block_i.shape[0]:
             return
-        i = pair_i[idx]
-        j = pair_j[idx]
+        bi = block_i[blk]
+        bj = block_j[blk]
+
+        # Offset within the i-block / j-block respectively.
+        tx = cuda.threadIdx.x
+        ty = cuda.threadIdx.y
+
+        i = bi * TILE + tx
+        j = bj * TILE + ty
+        valid = i < n_samples and j < n_samples and i < j
+
         n_nodes = proportions.shape[1]
+
+        sh_prop_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+        sh_prop_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+        sh_cnt_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+        sh_cnt_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+        sh_branch = cuda.shared.array(NODE_CHUNK, dtype=float64)
+
+        lin_tid = ty * TILE + tx
+        n_threads_blk = TILE * TILE
+        tile_elems = TILE * NODE_CHUNK
+
         numerator = 0.0
         denominator = 0.0
-        for k in range(n_nodes):
-            p_u = proportions[i, k]
-            p_v = proportions[j, k]
-            length = branch_lengths[k]
-            s = p_u + p_v
-            d = abs(p_u - p_v)
-            if variance_adjust:
-                m = sample_totals[i] + sample_totals[j]
-                mi = counts[i, k] + counts[j, k]
-                vaw = math.sqrt(mi * (m - mi))
-                if vaw <= 0.0:
-                    continue
-                s = s / vaw
-                d = d / vaw
-            if method == WEIGHTED_NORMALIZED or method == WEIGHTED_UNNORMALIZED:
-                numerator += length * d
-                denominator += length * s
-            elif method == UNWEIGHTED or method == UNWEIGHTED_UNNORMALIZED:
-                if s <= 0.0:
-                    continue
-                observed = p_u > 0.0 or p_v > 0.0
-                differs = (p_u > 0.0) != (p_v > 0.0)
-                if observed:
+
+        n_chunks = (n_nodes + NODE_CHUNK - 1) // NODE_CHUNK
+        for c in range(n_chunks):
+            chunk_start = c * NODE_CHUNK
+            chunk_len = n_nodes - chunk_start
+            if chunk_len > NODE_CHUNK:
+                chunk_len = NODE_CHUNK
+
+            # Cooperative load: every thread in the block (valid or not)
+            # helps fill the i-tile and j-tile shared buffers for this
+            # node-chunk, strided by the number of threads in the block.
+            for e in range(lin_tid, tile_elems, n_threads_blk):
+                row = e // NODE_CHUNK
+                col = e % NODE_CHUNK
+                node = chunk_start + col
+                samp_i = bi * TILE + row
+                samp_j = bj * TILE + row
+                if col < chunk_len and samp_i < n_samples:
+                    sh_prop_i[row, col] = proportions[samp_i, node]
+                    sh_cnt_i[row, col] = counts[samp_i, node]
+                else:
+                    sh_prop_i[row, col] = 0.0
+                    sh_cnt_i[row, col] = 0.0
+                if col < chunk_len and samp_j < n_samples:
+                    sh_prop_j[row, col] = proportions[samp_j, node]
+                    sh_cnt_j[row, col] = counts[samp_j, node]
+                else:
+                    sh_prop_j[row, col] = 0.0
+                    sh_cnt_j[row, col] = 0.0
+
+            for e in range(lin_tid, NODE_CHUNK, n_threads_blk):
+                node = chunk_start + e
+                sh_branch[e] = branch_lengths[node] if e < chunk_len else 0.0
+
+            cuda.syncthreads()
+
+            if valid:
+                for col in range(chunk_len):
+                    p_u = sh_prop_i[tx, col]
+                    p_v = sh_prop_j[ty, col]
+                    length = sh_branch[col]
+                    s = p_u + p_v
+                    d = abs(p_u - p_v)
                     if variance_adjust:
-                        numerator += length / vaw if differs else 0.0
-                        denominator += length / vaw
-                    else:
-                        numerator += length if differs else 0.0
-                        denominator += length
-            elif method == GENERALIZED:
-                if s == 0.0:
-                    continue
-                sum_pow = length * s**alpha
-                numerator += sum_pow * (d / s)
-                denominator += sum_pow
-        if method == WEIGHTED_UNNORMALIZED or method == UNWEIGHTED_UNNORMALIZED:
-            out[idx] = numerator
-        else:
-            out[idx] = 0.0 if denominator == 0.0 else numerator / denominator
+                        m = sample_totals[i] + sample_totals[j]
+                        mi = sh_cnt_i[tx, col] + sh_cnt_j[ty, col]
+                        vaw = math.sqrt(mi * (m - mi))
+                        if vaw <= 0.0:
+                            continue
+                        s = s / vaw
+                        d = d / vaw
+                    if method == WEIGHTED_NORMALIZED or method == WEIGHTED_UNNORMALIZED:
+                        numerator += length * d
+                        denominator += length * s
+                    elif method == UNWEIGHTED or method == UNWEIGHTED_UNNORMALIZED:
+                        if s <= 0.0:
+                            continue
+                        observed = p_u > 0.0 or p_v > 0.0
+                        differs = (p_u > 0.0) != (p_v > 0.0)
+                        if observed:
+                            if variance_adjust:
+                                numerator += length / vaw if differs else 0.0
+                                denominator += length / vaw
+                            else:
+                                numerator += length if differs else 0.0
+                                denominator += length
+                    elif method == GENERALIZED:
+                        if s == 0.0:
+                            continue
+                        sum_pow = length * s**alpha
+                        numerator += sum_pow * (d / s)
+                        denominator += sum_pow
+
+            # Must finish before the next iteration overwrites the shared
+            # tiles just read above.
+            cuda.syncthreads()
+
+        if valid:
+            idx = i * n_samples - (i * (i + 1)) // 2 + (j - i - 1)
+            if method == WEIGHTED_UNNORMALIZED or method == UNWEIGHTED_UNNORMALIZED:
+                out[idx] = numerator
+            else:
+                out[idx] = 0.0 if denominator == 0.0 else numerator / denominator
 
     # Keep a reference to the module so its id() cannot be reused by another
     # object while this entry lives.
-    _KERNEL_CACHE[id(cuda)] = (cuda, _unifrac_pair_kernel)
-    return _unifrac_pair_kernel
+    _KERNEL_CACHE[id(cuda)] = (cuda, _unifrac_block_kernel)
+    return _unifrac_block_kernel
 
 
 def weighted_unifrac_gpu(
@@ -229,22 +323,20 @@ def weighted_unifrac_gpu(
         out=np.zeros_like(counts_by_node),
         where=sample_totals[:, None] > 0,
     )
-    pair_i, pair_j = _build_pair_index(n_samples)
-    n_pairs = pair_i.shape[0]
+    n_pairs = n_samples * (n_samples - 1) // 2
+    block_i, block_j = _build_block_pair_index(n_samples, TILE)
 
     d_proportions = cuda.to_device(proportions)
     d_counts = cuda.to_device(counts_by_node)
     d_sample_totals = cuda.to_device(sample_totals)
     d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
-    d_pair_i = cuda.to_device(pair_i)
-    d_pair_j = cuda.to_device(pair_j)
+    d_block_i = cuda.to_device(block_i)
+    d_block_j = cuda.to_device(block_j)
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
     method = WEIGHTED_NORMALIZED if normalized else WEIGHTED_UNNORMALIZED
     kernel = _make_unifrac_kernel(cuda)
-    threads_per_block = 256
-    blocks = (n_pairs + threads_per_block - 1) // threads_per_block
-    kernel[blocks, threads_per_block](
+    kernel[block_i.shape[0], (TILE, TILE)](
         d_proportions,
         d_counts,
         d_sample_totals,
@@ -252,8 +344,9 @@ def weighted_unifrac_gpu(
         method,
         1.0,
         variance_adjust,
-        d_pair_i,
-        d_pair_j,
+        d_block_i,
+        d_block_j,
+        n_samples,
         d_out,
     )
     return d_out.copy_to_host()
@@ -284,22 +377,20 @@ def unweighted_unifrac_gpu(
     # The unweighted kernel branch only tests "proportions" for > 0 (presence/
     # absence), so raw counts can be passed directly in place of proportions,
     # no division needed.
-    pair_i, pair_j = _build_pair_index(n_samples)
-    n_pairs = pair_i.shape[0]
+    n_pairs = n_samples * (n_samples - 1) // 2
+    block_i, block_j = _build_block_pair_index(n_samples, TILE)
 
     d_proportions = cuda.to_device(counts_by_node)
     d_counts = cuda.to_device(counts_by_node)
     d_sample_totals = cuda.to_device(sample_totals)
     d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
-    d_pair_i = cuda.to_device(pair_i)
-    d_pair_j = cuda.to_device(pair_j)
+    d_block_i = cuda.to_device(block_i)
+    d_block_j = cuda.to_device(block_j)
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
     method = UNWEIGHTED if normalized else UNWEIGHTED_UNNORMALIZED
     kernel = _make_unifrac_kernel(cuda)
-    threads_per_block = 256
-    blocks = (n_pairs + threads_per_block - 1) // threads_per_block
-    kernel[blocks, threads_per_block](
+    kernel[block_i.shape[0], (TILE, TILE)](
         d_proportions,
         d_counts,
         d_sample_totals,
@@ -307,8 +398,9 @@ def unweighted_unifrac_gpu(
         method,
         1.0,
         variance_adjust,
-        d_pair_i,
-        d_pair_j,
+        d_block_i,
+        d_block_j,
+        n_samples,
         d_out,
     )
     return d_out.copy_to_host()
@@ -341,21 +433,19 @@ def generalized_unifrac_gpu(
         out=np.zeros_like(counts_by_node),
         where=sample_totals[:, None] > 0,
     )
-    pair_i, pair_j = _build_pair_index(n_samples)
-    n_pairs = pair_i.shape[0]
+    n_pairs = n_samples * (n_samples - 1) // 2
+    block_i, block_j = _build_block_pair_index(n_samples, TILE)
 
     d_proportions = cuda.to_device(proportions)
     d_counts = cuda.to_device(counts_by_node)
     d_sample_totals = cuda.to_device(sample_totals)
     d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
-    d_pair_i = cuda.to_device(pair_i)
-    d_pair_j = cuda.to_device(pair_j)
+    d_block_i = cuda.to_device(block_i)
+    d_block_j = cuda.to_device(block_j)
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
     kernel = _make_unifrac_kernel(cuda)
-    threads_per_block = 256
-    blocks = (n_pairs + threads_per_block - 1) // threads_per_block
-    kernel[blocks, threads_per_block](
+    kernel[block_i.shape[0], (TILE, TILE)](
         d_proportions,
         d_counts,
         d_sample_totals,
@@ -363,8 +453,9 @@ def generalized_unifrac_gpu(
         GENERALIZED,
         alpha,
         variance_adjust,
-        d_pair_i,
-        d_pair_j,
+        d_block_i,
+        d_block_j,
+        n_samples,
         d_out,
     )
     return d_out.copy_to_host()
