@@ -9,15 +9,20 @@
 import importlib.util
 import sys
 from unittest import TestCase, main
+from unittest.mock import patch
 
 import numpy as np
 
 from skbio import DistanceMatrix
 from skbio.diversity.beta._unifrac_gpu import (
     _KERNEL_CACHE,
+    _TILE_CANDIDATES,
+    _TILE_CONFIG_CACHE,
     _build_pair_index,
     _get_tile_config,
     _make_unifrac_kernel,
+    _probe_tile_config,
+    _probe_tile_config_candidate,
     detect_gpu_backend,
     generalized_unifrac_gpu,
     get_cuda_module,
@@ -163,26 +168,221 @@ class BuildPairIndexTests(TestCase):
             self.assertEqual(pair_j.dtype, np.int32)
 
 
-class GetTileConfigTests(TestCase):
-    """`_get_tile_config` picks the right (TILE, NODE_CHUNK) per backend.
+class _FakeDeviceArray:
+    """Stands in for a `numba.cuda` device array, just enough to support
+    `_probe_tile_config_candidate`'s `copy_to_host()` call at the end of a
+    (faked) launch."""
 
-    AMD's 1024-thread block (32, 32) crashes at launch on NVIDIA with
-    CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (register budget), so the two
-    backends must not resolve to the same config.
+    def __init__(self, arr):
+        self._arr = arr
+
+    def copy_to_host(self):
+        return self._arr
+
+
+class _ProbingFakeCuda:
+    """Stands in for `numba.cuda`/`numba.hip`, good enough to drive
+    `_probe_tile_config`'s compile-launch-catch control flow without real
+    GPU hardware.
+
+    Each call to `.jit(func)` corresponds to one candidate attempt (since
+    `_make_unifrac_kernel` is keyed by `(id(cuda), tile, node_chunk)`, a
+    fresh cache miss -- and hence a fresh `.jit()` call -- happens for
+    every distinct candidate tried). The returned dispatcher's
+    `[grid, block](...)` call raises the next scripted outcome in
+    ``launch_outcomes`` instead of actually running the kernel body (which
+    uses `cuda.shared.array`/`threadIdx`/`syncthreads`, none of which this
+    fake implements) -- the probe only cares whether the launch raises, not
+    what the kernel computes.
     """
 
-    def test_hip_keeps_the_amd_tuned_config(self):
-        self.assertEqual(_get_tile_config("hip"), (32, 32))
+    def __init__(self, launch_outcomes):
+        # One entry per expected `.jit()` call: None means "succeeds",
+        # an exception instance means "raise this instead".
+        self._outcomes = list(launch_outcomes)
+        self.jit_call_count = 0
 
-    def test_cuda_uses_a_smaller_block(self):
-        tile, _ = _get_tile_config("cuda")
-        self.assertLess(tile, 32)
+    def to_device(self, arr):
+        return np.asarray(arr)
 
-    def test_hip_and_cuda_configs_differ(self):
-        self.assertNotEqual(_get_tile_config("hip"), _get_tile_config("cuda"))
+    def device_array(self, shape, dtype):
+        return _FakeDeviceArray(np.zeros(shape, dtype=dtype))
 
-    def test_unrecognized_backend_falls_back_to_amd_default(self):
-        self.assertEqual(_get_tile_config("bogus"), (32, 32))
+    def jit(self, func):
+        outcome_index = self.jit_call_count
+        self.jit_call_count += 1
+        outcomes = self._outcomes
+
+        class _Dispatcher:
+            @staticmethod
+            def __getitem__(grid_block):
+                def _launch(*args, **kwargs):
+                    outcome = outcomes[outcome_index]
+                    if outcome is not None:
+                        raise outcome
+
+                return _launch
+
+        return _Dispatcher()
+
+
+class ProbeTileConfigCandidateTests(TestCase):
+    """`_probe_tile_config_candidate` drives a real compile+launch of the
+    actual kernel against tiny dummy data (no GPU required, via
+    `_ProbingFakeCuda`)."""
+
+    def _cleanup_kernel_cache(self, fake):
+        for tile, node_chunk in _TILE_CANDIDATES:
+            _KERNEL_CACHE.pop((id(fake), tile, node_chunk), None)
+
+    def test_succeeds_silently_when_launch_does_not_raise(self):
+        fake = _ProbingFakeCuda(launch_outcomes=[None])
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        # Should not raise.
+        _probe_tile_config_candidate(fake, 16, 32)
+        self.assertEqual(fake.jit_call_count, 1)
+
+    def test_propagates_the_launch_exception(self):
+        fake = _ProbingFakeCuda(launch_outcomes=[RuntimeError("boom")])
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            _probe_tile_config_candidate(fake, 32, 32)
+
+
+class ProbeTileConfigTests(TestCase):
+    """`_probe_tile_config` walks `_TILE_CANDIDATES` in order and returns
+    the first one that actually works, handling both known failure shapes
+    (an NVIDIA-style launch-time error, an AMD-style compile-time
+    RuntimeError) plus anything else via a broad catch, since these are
+    controlled probes against synthetic data, not user input.
+    """
+
+    def _cleanup_kernel_cache(self, fake):
+        for tile, node_chunk in _TILE_CANDIDATES:
+            _KERNEL_CACHE.pop((id(fake), tile, node_chunk), None)
+
+    def test_first_candidate_succeeding_is_used_without_trying_others(self):
+        fake = _ProbingFakeCuda(launch_outcomes=[None])
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        result = _probe_tile_config(fake, "hip")
+        self.assertEqual(result, _TILE_CANDIDATES[0])
+        self.assertEqual(fake.jit_call_count, 1)
+
+    def test_nvidia_style_launch_error_falls_through_to_next_candidate(self):
+        # Simulates the real NVIDIA failure mode: the most aggressive
+        # candidate(s) raise a launch-time resource error, and the probe
+        # moves on to try the next candidate instead of giving up.
+        cuda_error = type("CudaAPIError", (Exception,), {})(
+            "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES"
+        )
+        fake = _ProbingFakeCuda(launch_outcomes=[cuda_error, cuda_error, None, None])
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        result = _probe_tile_config(fake, "cuda")
+        self.assertEqual(result, _TILE_CANDIDATES[2])
+        self.assertEqual(fake.jit_call_count, 3)
+
+    def test_amd_style_compile_error_falls_through_to_next_candidate(self):
+        # Simulates the real AMD failure mode: a compile-time RuntimeError
+        # from rocm.amd_comgr (numba.hip compiles lazily, on first
+        # invocation, so this still surfaces at "launch" time from this
+        # function's point of view).
+        comgr_error = RuntimeError(
+            "AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE failed: "
+            "local memory (66560) exceeds limit (65536)"
+        )
+        fake = _ProbingFakeCuda(launch_outcomes=[comgr_error, None])
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        result = _probe_tile_config(fake, "hip")
+        self.assertEqual(result, _TILE_CANDIDATES[1])
+        self.assertEqual(fake.jit_call_count, 2)
+
+    def test_mixed_failure_types_are_all_caught(self):
+        # A third, unanticipated exception type should also be caught by
+        # the deliberately-broad probe, not just the two known shapes.
+        outcomes = [
+            type("CudaAPIError", (Exception,), {})("launch failed"),
+            RuntimeError("AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE failed"),
+            ValueError("some other, unanticipated failure"),
+            None,
+        ]
+        fake = _ProbingFakeCuda(launch_outcomes=outcomes)
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        result = _probe_tile_config(fake, "cuda")
+        self.assertEqual(result, _TILE_CANDIDATES[3])
+        self.assertEqual(fake.jit_call_count, 4)
+
+    def test_raises_clear_error_when_every_candidate_fails(self):
+        fail = RuntimeError("nope")
+        fake = _ProbingFakeCuda(launch_outcomes=[fail] * len(_TILE_CANDIDATES))
+        self.addCleanup(self._cleanup_kernel_cache, fake)
+        with self.assertRaisesRegex(RuntimeError, "No safe"):
+            _probe_tile_config(fake, "cuda")
+        self.assertEqual(fake.jit_call_count, len(_TILE_CANDIDATES))
+
+
+class GetTileConfigTests(TestCase):
+    """`_get_tile_config` probes once per backend and caches the result,
+    rather than looking up a fixed per-backend dict (the hardware-specific
+    safe config cannot be known statically, see `_unifrac_gpu.py`)."""
+
+    def setUp(self):
+        # Each test starts from a clean cache so probes/call-counts are
+        # deterministic and tests cannot see each other's cached results.
+        self._orig_cache = dict(_TILE_CONFIG_CACHE)
+        _TILE_CONFIG_CACHE.clear()
+        self.addCleanup(self._restore_cache)
+
+    def _restore_cache(self):
+        _TILE_CONFIG_CACHE.clear()
+        _TILE_CONFIG_CACHE.update(self._orig_cache)
+
+    def test_probes_and_caches_on_first_call(self):
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
+            return_value=(16, 32),
+        ) as mock_probe:
+            result = _get_tile_config("cuda", "fake-cuda-module")
+        self.assertEqual(result, (16, 32))
+        mock_probe.assert_called_once_with("fake-cuda-module", "cuda")
+        self.assertEqual(_TILE_CONFIG_CACHE["cuda"], (16, 32))
+
+    def test_second_call_for_the_same_backend_does_not_reprobe(self):
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
+            return_value=(32, 32),
+        ) as mock_probe:
+            first = _get_tile_config("hip", "fake-cuda-module")
+            second = _get_tile_config("hip", "fake-cuda-module")
+        self.assertEqual(first, (32, 32))
+        self.assertEqual(second, (32, 32))
+        mock_probe.assert_called_once()
+
+    def test_distinct_backends_are_probed_and_cached_independently(self):
+        def fake_probe(cuda, backend):
+            return {"cuda": (16, 32), "hip": (32, 32)}[backend]
+
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
+            side_effect=fake_probe,
+        ) as mock_probe:
+            cuda_result = _get_tile_config("cuda", "fake-cuda-module")
+            hip_result = _get_tile_config("hip", "fake-hip-module")
+            # Calling again for either backend must not re-probe.
+            _get_tile_config("cuda", "fake-cuda-module")
+            _get_tile_config("hip", "fake-hip-module")
+        self.assertEqual(cuda_result, (16, 32))
+        self.assertEqual(hip_result, (32, 32))
+        self.assertEqual(mock_probe.call_count, 2)
+
+    def test_a_failed_probe_is_not_cached_and_raises(self):
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
+            side_effect=RuntimeError("No safe tile configuration"),
+        ) as mock_probe:
+            with self.assertRaises(RuntimeError):
+                _get_tile_config("cuda", "fake-cuda-module")
+        self.assertNotIn("cuda", _TILE_CONFIG_CACHE)
+        mock_probe.assert_called_once()
 
 
 class MakeUnifracKernelTests(TestCase):
