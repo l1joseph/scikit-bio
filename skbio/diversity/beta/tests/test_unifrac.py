@@ -792,6 +792,23 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         )
         self.assertEqual(obs, 0.0)
 
+    def test_generalized_unifrac_both_empty_is_zero_via_real_dispatch(self):
+        # Companion to test_generalized_unifrac_both_empty_is_zero above:
+        # that test only pins the dead/unreachable CPU reference kernel
+        # (_generalized_unifrac) directly. This exercises the same
+        # both-samples-empty case through the live dispatch path
+        # (generalized_unifrac_gpu_or_xp) that real callers of
+        # generalized_unifrac(engine='gpu')/beta_diversity actually hit --
+        # the fused kernel when a GPU backend is usable, otherwise the
+        # array-API fallback, either way without needing real GPU hardware
+        # to run this test.
+        from skbio.diversity.beta._unifrac_gpu import generalized_unifrac_gpu_or_xp
+        table = np.array([[0, 0, 0], [0, 0, 0]])
+        obs = generalized_unifrac_gpu_or_xp(
+            table, self.oids1[:3], self.t1, alpha=1.0, variance_adjust=False,
+        )
+        np.testing.assert_allclose(obs, [0.0])
+
     def test_generalized_unifrac_cpu_raises_not_implemented(self):
         # generalized_unifrac has no CPU implementation in this release; it
         # ships GPU-only regardless of numba availability (CPU/numba support

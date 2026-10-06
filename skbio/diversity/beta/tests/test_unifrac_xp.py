@@ -12,14 +12,18 @@ from unittest.mock import patch
 import numpy as np
 
 from skbio import DistanceMatrix
+from skbio.tree import DuplicateNodeError
 from skbio.diversity.beta._unifrac import (
     _weighted_unifrac_pdist_numba,
     _unweighted_unifrac_pdist_numba,
     _generalized_unifrac_pdist_numba,
 )
 from skbio.diversity.beta._unifrac_gpu import (
+    _dispatch_gpu_or_xp,
+    _unavailable_backends,
     generalized_unifrac_gpu_or_xp,
     unweighted_unifrac_gpu_or_xp,
+    weighted_unifrac_gpu,
     weighted_unifrac_gpu_or_xp,
 )
 from skbio.diversity.beta._unifrac_xp import (
@@ -216,6 +220,125 @@ class GpuOrXpDispatchTests(QiimeTinyTestMixin, TestCase):
         cpu = _generalized_unifrac_pdist_numba(
             table, taxa, tree, alpha=0.5, validate=True)
         np.testing.assert_allclose(obs, cpu, rtol=0, atol=XP_CPU_TOLERANCE)
+
+
+class DispatchValidationErrorTests(QiimeTinyTestMixin, TestCase):
+    """A bad tree/taxa input must raise its real validation error, not get
+    misclassified by `_dispatch_gpu_or_xp` as "this backend's kernel can't
+    run" (which would both hide the error behind the array-API fallback and
+    permanently degrade the backend to that fallback for the rest of the
+    process, over what was really just bad input on one call).
+    """
+
+    def setUp(self):
+        # Never let a previous test's (or this test's own) backend
+        # unavailability bleed across tests.
+        self._backends_backup = set(_unavailable_backends)
+        _unavailable_backends.clear()
+        self.addCleanup(_unavailable_backends.clear)
+        self.addCleanup(_unavailable_backends.update, self._backends_backup)
+
+    def test_dispatch_reraises_value_error_without_marking_backend_unavailable(self):
+        def bad_gpu_func(*args, **kwargs):
+            raise ValueError("bad input")
+
+        def xp_func(*args, **kwargs):
+            raise AssertionError("xp_func must not be reached")
+
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
+            return_value="hip",
+        ):
+            with self.assertRaises(ValueError):
+                _dispatch_gpu_or_xp(bad_gpu_func, xp_func)
+        self.assertNotIn("hip", _unavailable_backends)
+
+    def test_dispatch_reraises_tree_error_without_marking_backend_unavailable(self):
+        def bad_gpu_func(*args, **kwargs):
+            raise DuplicateNodeError("bad tree")
+
+        def xp_func(*args, **kwargs):
+            raise AssertionError("xp_func must not be reached")
+
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
+            return_value="hip",
+        ):
+            with self.assertRaises(DuplicateNodeError):
+                _dispatch_gpu_or_xp(bad_gpu_func, xp_func)
+        self.assertNotIn("hip", _unavailable_backends)
+
+    def test_dispatch_still_marks_backend_unavailable_for_genuine_kernel_errors(self):
+        # Sanity check for the other side of the fix: a non-validation
+        # exception (standing in for e.g. a numba-hip compile/runtime
+        # failure) must still fall through to the array-API path and mark
+        # the backend unavailable, exactly as before this fix.
+        def bad_gpu_func(*args, **kwargs):
+            raise RuntimeError("kernel failed to build")
+
+        def xp_func(*args, **kwargs):
+            return "xp result"
+
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
+            return_value="hip",
+        ):
+            with self.assertWarns(UserWarning):
+                obs = _dispatch_gpu_or_xp(bad_gpu_func, xp_func)
+        self.assertEqual(obs, "xp result")
+        self.assertIn("hip", _unavailable_backends)
+
+    def test_invalid_taxa_under_engine_gpu_raises_and_keeps_backend_usable(self):
+        # End-to-end version through the real `weighted_unifrac_gpu` driver:
+        # `_setup_multiple_unifrac` (called inside `weighted_unifrac_gpu`,
+        # before any GPU-specific code) raises on duplicate taxa (a
+        # ValueError -- "All taxa must be unique" -- distinct from the
+        # DuplicateNodeError the same validator raises for duplicate *tip
+        # names in the tree*; both are TreeError/ValueError cases this fix
+        # covers). A fake, never-actually-used cuda module stands in for
+        # `get_cuda_module`'s real backend-presence check, so this is
+        # exercisable without real GPU hardware; what is under test is
+        # purely the exception classification in
+        # `_dispatch_gpu_or_xp`/`weighted_unifrac_gpu`, not the kernel
+        # itself.
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        duplicate_taxa = list(taxa)
+        duplicate_taxa[1] = duplicate_taxa[0]
+
+        with patch(
+            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
+            return_value="hip",
+        ), patch(
+            "skbio.diversity.beta._unifrac_gpu.get_cuda_module",
+            return_value=object(),
+        ), patch(
+            "skbio.diversity.beta._unifrac_gpu.weighted_unifrac_gpu",
+            wraps=weighted_unifrac_gpu,
+        ) as spy_gpu_func:
+            with self.assertRaises(ValueError):
+                weighted_unifrac_gpu_or_xp(
+                    table, duplicate_taxa, tree, normalized=True, validate=True
+                )
+            self.assertNotIn("hip", _unavailable_backends)
+            self.assertEqual(spy_gpu_func.call_count, 1)
+
+            # A second, valid request on the still-usable backend must still
+            # attempt the real kernel driver, rather than having been
+            # silently routed to the fallback by the first call's
+            # (correctly re-raised) validation error.
+            obs = weighted_unifrac_gpu_or_xp(
+                table, taxa, tree, normalized=True, validate=True
+            )
+            self.assertEqual(spy_gpu_func.call_count, 2)
+            # The fake cuda module has none of numba.cuda's real API, so the
+            # kernel launch itself fails and this call falls back to the
+            # array-API path -- expected, since this test's fake-GPU setup
+            # cannot run a real kernel; what matters is that the driver was
+            # attempted (checked above) and the fallback result is correct.
+            cpu = _weighted_unifrac_pdist_numba(
+                table, taxa, tree, normalized=True, validate=True
+            )
+            np.testing.assert_allclose(obs, cpu, rtol=0, atol=XP_CPU_TOLERANCE)
 
 
 if __name__ == "__main__":

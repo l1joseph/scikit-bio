@@ -9,10 +9,10 @@
 """GPU backend detection for UniFrac (:mod:`skbio.diversity.beta._unifrac_gpu`)."""
 
 import math
+import threading
 from warnings import warn
 
 import numpy as np
-from numba import float64
 
 UNWEIGHTED = 0
 UNWEIGHTED_UNNORMALIZED = 1
@@ -70,6 +70,12 @@ _backend_cache = None
 # Compiled kernels, keyed by id() of the cuda-API module they were built
 # against. The module itself is stored alongside so the id stays valid.
 _KERNEL_CACHE = {}
+
+# Guards the check-compile-store sequence in `_make_unifrac_kernel` so
+# concurrent calls from different threads cannot both miss the cache and
+# redundantly recompile. Not a hot path (compilation is memoized after the
+# first call), so a single coarse lock is sufficient.
+_KERNEL_CACHE_LOCK = threading.Lock()
 
 
 def detect_gpu_backend():
@@ -195,143 +201,152 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
 
     """
     cache_key = (id(cuda), tile, node_chunk)
-    cached = _KERNEL_CACHE.get(cache_key)
-    if cached is not None:
-        return cached[1]
+    with _KERNEL_CACHE_LOCK:
+        cached = _KERNEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached[1]
 
-    TILE = tile
-    NODE_CHUNK = node_chunk
+        # Imported here, not at module level: this module must stay
+        # importable (and the array-API fallback reachable) on a system with
+        # no numba installed at all. This function is only ever reached via
+        # `_run_unifrac_kernel`, after `get_cuda_module()` has already
+        # succeeded, which means some numba variant (numba-cuda or
+        # numba.hip, both of which depend on core numba) is installed.
+        from numba import float64
 
-    @cuda.jit
-    def _unifrac_block_kernel(
-        proportions,
-        counts,
-        sample_totals,
-        branch_lengths,
-        method,
-        alpha,
-        variance_adjust,
-        block_i,
-        block_j,
-        n_samples,
-        out,
-    ):
-        blk = cuda.blockIdx.x
-        if blk >= block_i.shape[0]:
-            return
-        bi = block_i[blk]
-        bj = block_j[blk]
+        TILE = tile
+        NODE_CHUNK = node_chunk
 
-        # Offset within the i-block / j-block respectively.
-        tx = cuda.threadIdx.x
-        ty = cuda.threadIdx.y
+        @cuda.jit
+        def _unifrac_block_kernel(
+            proportions,
+            counts,
+            sample_totals,
+            branch_lengths,
+            method,
+            alpha,
+            variance_adjust,
+            block_i,
+            block_j,
+            n_samples,
+            out,
+        ):
+            blk = cuda.blockIdx.x
+            if blk >= block_i.shape[0]:
+                return
+            bi = block_i[blk]
+            bj = block_j[blk]
 
-        i = bi * TILE + tx
-        j = bj * TILE + ty
-        valid = i < n_samples and j < n_samples and i < j
+            # Offset within the i-block / j-block respectively.
+            tx = cuda.threadIdx.x
+            ty = cuda.threadIdx.y
 
-        n_nodes = proportions.shape[1]
+            i = bi * TILE + tx
+            j = bj * TILE + ty
+            valid = i < n_samples and j < n_samples and i < j
 
-        sh_prop_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
-        sh_prop_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
-        sh_cnt_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
-        sh_cnt_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
-        sh_branch = cuda.shared.array(NODE_CHUNK, dtype=float64)
+            n_nodes = proportions.shape[1]
 
-        lin_tid = ty * TILE + tx
-        n_threads_blk = TILE * TILE
-        tile_elems = TILE * NODE_CHUNK
+            sh_prop_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+            sh_prop_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+            sh_cnt_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+            sh_cnt_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
+            sh_branch = cuda.shared.array(NODE_CHUNK, dtype=float64)
 
-        numerator = 0.0
-        denominator = 0.0
+            lin_tid = ty * TILE + tx
+            n_threads_blk = TILE * TILE
+            tile_elems = TILE * NODE_CHUNK
 
-        n_chunks = (n_nodes + NODE_CHUNK - 1) // NODE_CHUNK
-        for c in range(n_chunks):
-            chunk_start = c * NODE_CHUNK
-            chunk_len = n_nodes - chunk_start
-            if chunk_len > NODE_CHUNK:
-                chunk_len = NODE_CHUNK
+            numerator = 0.0
+            denominator = 0.0
 
-            # Cooperative load: every thread in the block (valid or not)
-            # helps fill the i-tile and j-tile shared buffers for this
-            # node-chunk, strided by the number of threads in the block.
-            for e in range(lin_tid, tile_elems, n_threads_blk):
-                row = e // NODE_CHUNK
-                col = e % NODE_CHUNK
-                node = chunk_start + col
-                samp_i = bi * TILE + row
-                samp_j = bj * TILE + row
-                if col < chunk_len and samp_i < n_samples:
-                    sh_prop_i[row, col] = proportions[samp_i, node]
-                    sh_cnt_i[row, col] = counts[samp_i, node]
-                else:
-                    sh_prop_i[row, col] = 0.0
-                    sh_cnt_i[row, col] = 0.0
-                if col < chunk_len and samp_j < n_samples:
-                    sh_prop_j[row, col] = proportions[samp_j, node]
-                    sh_cnt_j[row, col] = counts[samp_j, node]
-                else:
-                    sh_prop_j[row, col] = 0.0
-                    sh_cnt_j[row, col] = 0.0
+            n_chunks = (n_nodes + NODE_CHUNK - 1) // NODE_CHUNK
+            for c in range(n_chunks):
+                chunk_start = c * NODE_CHUNK
+                chunk_len = n_nodes - chunk_start
+                if chunk_len > NODE_CHUNK:
+                    chunk_len = NODE_CHUNK
 
-            for e in range(lin_tid, NODE_CHUNK, n_threads_blk):
-                node = chunk_start + e
-                sh_branch[e] = branch_lengths[node] if e < chunk_len else 0.0
+                # Cooperative load: every thread in the block (valid or not)
+                # helps fill the i-tile and j-tile shared buffers for this
+                # node-chunk, strided by the number of threads in the block.
+                for e in range(lin_tid, tile_elems, n_threads_blk):
+                    row = e // NODE_CHUNK
+                    col = e % NODE_CHUNK
+                    node = chunk_start + col
+                    samp_i = bi * TILE + row
+                    samp_j = bj * TILE + row
+                    if col < chunk_len and samp_i < n_samples:
+                        sh_prop_i[row, col] = proportions[samp_i, node]
+                        sh_cnt_i[row, col] = counts[samp_i, node]
+                    else:
+                        sh_prop_i[row, col] = 0.0
+                        sh_cnt_i[row, col] = 0.0
+                    if col < chunk_len and samp_j < n_samples:
+                        sh_prop_j[row, col] = proportions[samp_j, node]
+                        sh_cnt_j[row, col] = counts[samp_j, node]
+                    else:
+                        sh_prop_j[row, col] = 0.0
+                        sh_cnt_j[row, col] = 0.0
 
-            cuda.syncthreads()
+                for e in range(lin_tid, NODE_CHUNK, n_threads_blk):
+                    node = chunk_start + e
+                    sh_branch[e] = branch_lengths[node] if e < chunk_len else 0.0
+
+                cuda.syncthreads()
+
+                if valid:
+                    for col in range(chunk_len):
+                        p_u = sh_prop_i[tx, col]
+                        p_v = sh_prop_j[ty, col]
+                        length = sh_branch[col]
+                        s = p_u + p_v
+                        d = abs(p_u - p_v)
+                        if variance_adjust:
+                            m = sample_totals[i] + sample_totals[j]
+                            mi = sh_cnt_i[tx, col] + sh_cnt_j[ty, col]
+                            vaw = math.sqrt(mi * (m - mi))
+                            if vaw <= 0.0:
+                                continue
+                            s = s / vaw
+                            d = d / vaw
+                        if method == WEIGHTED_NORMALIZED or method == WEIGHTED_UNNORMALIZED:
+                            numerator += length * d
+                            denominator += length * s
+                        elif method == UNWEIGHTED or method == UNWEIGHTED_UNNORMALIZED:
+                            if s <= 0.0:
+                                continue
+                            observed = p_u > 0.0 or p_v > 0.0
+                            differs = (p_u > 0.0) != (p_v > 0.0)
+                            if observed:
+                                if variance_adjust:
+                                    numerator += length / vaw if differs else 0.0
+                                    denominator += length / vaw
+                                else:
+                                    numerator += length if differs else 0.0
+                                    denominator += length
+                        elif method == GENERALIZED:
+                            if s == 0.0:
+                                continue
+                            sum_pow = length * s**alpha
+                            numerator += sum_pow * (d / s)
+                            denominator += sum_pow
+
+                # Must finish before the next iteration overwrites the shared
+                # tiles just read above.
+                cuda.syncthreads()
 
             if valid:
-                for col in range(chunk_len):
-                    p_u = sh_prop_i[tx, col]
-                    p_v = sh_prop_j[ty, col]
-                    length = sh_branch[col]
-                    s = p_u + p_v
-                    d = abs(p_u - p_v)
-                    if variance_adjust:
-                        m = sample_totals[i] + sample_totals[j]
-                        mi = sh_cnt_i[tx, col] + sh_cnt_j[ty, col]
-                        vaw = math.sqrt(mi * (m - mi))
-                        if vaw <= 0.0:
-                            continue
-                        s = s / vaw
-                        d = d / vaw
-                    if method == WEIGHTED_NORMALIZED or method == WEIGHTED_UNNORMALIZED:
-                        numerator += length * d
-                        denominator += length * s
-                    elif method == UNWEIGHTED or method == UNWEIGHTED_UNNORMALIZED:
-                        if s <= 0.0:
-                            continue
-                        observed = p_u > 0.0 or p_v > 0.0
-                        differs = (p_u > 0.0) != (p_v > 0.0)
-                        if observed:
-                            if variance_adjust:
-                                numerator += length / vaw if differs else 0.0
-                                denominator += length / vaw
-                            else:
-                                numerator += length if differs else 0.0
-                                denominator += length
-                    elif method == GENERALIZED:
-                        if s == 0.0:
-                            continue
-                        sum_pow = length * s**alpha
-                        numerator += sum_pow * (d / s)
-                        denominator += sum_pow
+                idx = i * n_samples - (i * (i + 1)) // 2 + (j - i - 1)
+                if method == WEIGHTED_UNNORMALIZED or method == UNWEIGHTED_UNNORMALIZED:
+                    out[idx] = numerator
+                else:
+                    out[idx] = 0.0 if denominator == 0.0 else numerator / denominator
 
-            # Must finish before the next iteration overwrites the shared
-            # tiles just read above.
-            cuda.syncthreads()
-
-        if valid:
-            idx = i * n_samples - (i * (i + 1)) // 2 + (j - i - 1)
-            if method == WEIGHTED_UNNORMALIZED or method == UNWEIGHTED_UNNORMALIZED:
-                out[idx] = numerator
-            else:
-                out[idx] = 0.0 if denominator == 0.0 else numerator / denominator
-
-    # Keep a reference to the module so its id() cannot be reused by another
-    # object while this entry lives.
-    _KERNEL_CACHE[cache_key] = (cuda, _unifrac_block_kernel)
-    return _unifrac_block_kernel
+        # Keep a reference to the module so its id() cannot be reused by another
+        # object while this entry lives.
+        _KERNEL_CACHE[cache_key] = (cuda, _unifrac_block_kernel)
+        return _unifrac_block_kernel
 
 
 def _run_unifrac_kernel(
@@ -374,7 +389,14 @@ def _run_unifrac_kernel(
     # asynchronous, so each device array must stay referenced until the
     # copy_to_host() that synchronizes on it.
     d_proportions = cuda.to_device(proportions)
-    d_counts = cuda.to_device(counts_by_node)
+    # For the unweighted methods, `proportions` *is* `counts_by_node` (see
+    # above -- no division needed), so reuse the one transfer already made
+    # for `d_proportions` instead of uploading the identical host array a
+    # second time.
+    if proportions is counts_by_node:
+        d_counts = d_proportions
+    else:
+        d_counts = cuda.to_device(counts_by_node)
     d_sample_totals = cuda.to_device(sample_totals)
     d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
     d_block_i = cuda.to_device(block_i)
@@ -503,14 +525,27 @@ def _mark_backend_unavailable(backend):
 def _dispatch_gpu_or_xp(gpu_func, xp_func, *args, **kwargs):
     """Call ``gpu_func`` if the fused kernel is usable, else ``xp_func``.
 
-    Any exception out of the fused kernel marks its backend unavailable for
+    An exception out of the fused kernel marks its backend unavailable for
     the rest of the process and falls through to the array-API path, so one
-    bad kernel build degrades performance rather than failing the call.
+    bad kernel build degrades performance rather than failing the call --
+    *except* for input-validation errors (``ValueError`` and the
+    ``skbio.tree.TreeError`` family, e.g. ``MissingNodeError``/
+    ``DuplicateNodeError``), which ``gpu_func`` raises from its own
+    ``_setup_multiple_unifrac`` call before any GPU-specific code runs.
+    Those are the caller's fault, not the backend's, so they are re-raised
+    immediately rather than being misclassified as "this backend's kernel
+    can't run" -- which would both hide the real error behind a fallback
+    and permanently (for the rest of the process) degrade every later call
+    to the slow array-API path over one bad input.
     """
+    from skbio.tree import TreeError
+
     backend = detect_gpu_backend()
     if backend is not None and backend not in _unavailable_backends:
         try:
             return gpu_func(*args, **kwargs)
+        except (ValueError, TreeError):
+            raise
         except Exception:
             _mark_backend_unavailable(backend)
     return xp_func(*args, **kwargs)

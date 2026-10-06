@@ -6,6 +6,8 @@
 # The full license is in the file LICENSE.txt, distributed with this software.
 # ----------------------------------------------------------------------------
 
+import importlib.util
+import sys
 from unittest import TestCase, main
 
 import numpy as np
@@ -54,6 +56,80 @@ class GpuBackendTests(TestCase):
             self.skipTest("a GPU backend is available in this environment")
         with self.assertRaises(ImportError):
             get_cuda_module()
+
+
+class NumbaOptionalImportTests(TestCase):
+    """`_unifrac_gpu` must stay importable, and `engine='gpu'` reachable via
+    the array-API fallback, on a system with no numba installed at all.
+
+    numba is an optional dependency project-wide (see
+    `skbio.diversity.beta._unifrac.NUMBA_AVAILABLE`), so the module-level
+    import of this module cannot assume numba is present -- it must defer
+    any numba import to the point where a GPU kernel is actually compiled,
+    which only happens after a real GPU backend has already been detected.
+
+    Simulates "numba not installed" the same way
+    `skbio.util.tests.test_plotting` simulates "matplotlib not installed":
+    setting `sys.modules['numba'] = None` makes any subsequent `import
+    numba` (including submodule imports like `from numba import cuda`)
+    raise ``ImportError`` without numba actually being uninstalled.
+
+    Executes a throwaway *copy* of ``_unifrac_gpu``'s source (via
+    ``importlib.util``) rather than reloading the real, already-imported
+    module in place: other test modules hold direct references to the real
+    module's mutable globals (e.g. ``_unavailable_backends``,
+    ``_KERNEL_CACHE``), and `importlib.reload` would rebind those names to
+    new objects in the real module's namespace without updating anyone
+    else's already-imported reference to the old one -- silently
+    desynchronizing this test's view of that state from everyone else's.
+    A separate module object sidesteps that entirely.
+    """
+
+    def _load_unifrac_gpu_without_numba(self):
+        """Execute a fresh copy of `_unifrac_gpu` with `numba` unimportable.
+
+        Registers restoration of the real `numba` via `addCleanup`, so this
+        always runs even if the test body raises.
+        """
+        import skbio.diversity.beta._unifrac_gpu as gpu_mod
+
+        numba_backup = {
+            name: mod for name, mod in sys.modules.items()
+            if name == "numba" or name.startswith("numba.")
+        }
+        for name in numba_backup:
+            del sys.modules[name]
+        sys.modules["numba"] = None
+
+        def _restore():
+            del sys.modules["numba"]
+            sys.modules.update(numba_backup)
+
+        self.addCleanup(_restore)
+
+        spec = importlib.util.spec_from_file_location(
+            "_unifrac_gpu_numba_absent_test_copy", gpu_mod.__file__
+        )
+        fresh_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh_mod)
+        return fresh_mod
+
+    def test_import_does_not_require_numba(self):
+        # The real regression: a module-level `from numba import float64`
+        # would raise ModuleNotFoundError right here, before engine='gpu'
+        # ever gets a chance to fall back to the array-API path.
+        fresh_mod = self._load_unifrac_gpu_without_numba()
+        self.assertIsNone(fresh_mod.detect_gpu_backend())
+
+    def test_gpu_or_xp_dispatch_works_without_numba(self):
+        table, taxa, tree, _ = QiimeTinyTestMixin()._load_qiime_191_tt()
+        fresh_mod = self._load_unifrac_gpu_without_numba()
+        # detect_gpu_backend() is None (numba unimportable), so this must use
+        # the array-API fallback, not raise.
+        obs = fresh_mod.weighted_unifrac_gpu_or_xp(
+            table, taxa, tree, normalized=True, validate=True
+        )
+        self.assertEqual(len(obs), len(table) * (len(table) - 1) // 2)
 
 
 class BuildPairIndexTests(TestCase):
