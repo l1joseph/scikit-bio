@@ -28,7 +28,8 @@ from skbio.diversity.beta._unifrac import (_unweighted_unifrac,
                                            _setup_pairwise_unifrac,
                                            NUMBA_AVAILABLE)
 from skbio.diversity._driver import _UNIFRAC_FAST_ENGINE
-from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
+from skbio.diversity.beta.tests._fixtures import (QiimeTinyTestMixin,
+                                                  patch_gpu_backend)
 from skbio.util import numba_code
 
 # Measured max abs deviation, CPU-numba vs ssu-ascii-fixture, across all 8
@@ -746,37 +747,41 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
     # through the public generalized_unifrac() function, which now always
     # requires engine='gpu'.
 
-    @numba_code
-    def test_generalized_unifrac_matches_ssu_fixture(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        for alpha, fname in [(0.5, 'generalized_unifrac_alpha0.5_dm.txt'),
-                             (1.0, 'generalized_unifrac_alpha1.0_dm.txt')]:
-            expected = self._load_dm_fixture(fname)
-            condensed = _generalized_unifrac_pdist_numba(
-                table, taxa, tree, alpha=alpha, validate=True,
-            )
-            obs = DistanceMatrix(condensed, sample_ids)
-            for i, j in [(0, 1), (2, 5), (3, 7)]:
-                self.assertAlmostEqual(
-                    obs[sample_ids[i], sample_ids[j]],
-                    expected[sample_ids[i], sample_ids[j]],
-                    delta=SSU_FIXTURE_TOLERANCE
-                )
+    def _assert_pairs_match_ssu_fixture(self, condensed, sample_ids, fname):
+        """Spot-check a few sample pairs against a qiime-191-tt fixture matrix.
 
-    @numba_code
-    def test_generalized_unifrac_variance_adjust_matches_ssu_fixture(self):
-        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
-        expected = self._load_dm_fixture('generalized_unifrac_alpha1.0_vaw_dm.txt')
-        condensed = _generalized_unifrac_pdist_numba(
-            table, taxa, tree, alpha=1.0, variance_adjust=True, validate=True,
-        )
+        A handful of representative pairs rather than the whole matrix: these
+        checks pin the CPU kernel against the ssu reference, and the GPU and
+        array-API paths are compared against this kernel entry-by-entry in
+        test_unifrac_gpu.py/test_unifrac_xp.py.
+        """
         obs = DistanceMatrix(condensed, sample_ids)
+        expected = self._load_dm_fixture(fname)
         for i, j in [(0, 1), (2, 5), (3, 7)]:
             self.assertAlmostEqual(
                 obs[sample_ids[i], sample_ids[j]],
                 expected[sample_ids[i], sample_ids[j]],
                 delta=SSU_FIXTURE_TOLERANCE
             )
+
+    @numba_code
+    def test_generalized_unifrac_matches_ssu_fixture(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        for alpha, fname in [(0.5, 'generalized_unifrac_alpha0.5_dm.txt'),
+                             (1.0, 'generalized_unifrac_alpha1.0_dm.txt')]:
+            condensed = _generalized_unifrac_pdist_numba(
+                table, taxa, tree, alpha=alpha, validate=True,
+            )
+            self._assert_pairs_match_ssu_fixture(condensed, sample_ids, fname)
+
+    @numba_code
+    def test_generalized_unifrac_variance_adjust_matches_ssu_fixture(self):
+        table, taxa, tree, sample_ids = self._load_qiime_191_tt()
+        condensed = _generalized_unifrac_pdist_numba(
+            table, taxa, tree, alpha=1.0, variance_adjust=True, validate=True,
+        )
+        self._assert_pairs_match_ssu_fixture(
+            condensed, sample_ids, 'generalized_unifrac_alpha1.0_vaw_dm.txt')
 
     @numba_code
     def test_generalized_unifrac_both_empty_is_zero(self):
@@ -827,10 +832,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
             )
 
     def test_generalized_unifrac_alpha_out_of_range_raises(self):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value="cuda",
-        ):
+        with patch_gpu_backend("cuda"):
             with self.assertRaises(ValueError):
                 generalized_unifrac(
                     [1, 0, 1], [0, 1, 1], ['a', 'b', 'c'], self.t1,
@@ -1237,10 +1239,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
     # test_unifrac_gpu.py.
 
     def test_unweighted_unifrac_gpu_engine_falls_back_without_gpu(self):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = unweighted_unifrac(
                 self.b1[0], self.b1[1], self.oids1, self.t1, engine='gpu')
         expected = unweighted_unifrac(
@@ -1248,10 +1247,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         self.assertAlmostEqual(obs, expected)
 
     def test_weighted_unifrac_gpu_engine_falls_back_without_gpu(self):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = weighted_unifrac(
                 self.b1[0], self.b1[1], self.oids1, self.t1, engine='gpu')
         expected = weighted_unifrac(
@@ -1259,10 +1255,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         self.assertAlmostEqual(obs, expected)
 
     def test_generalized_unifrac_gpu_engine_falls_back_without_gpu(self):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = generalized_unifrac(
                 self.b1[0], self.b1[1], self.oids1, self.t1, engine='gpu')
         u_node_counts, v_node_counts, u_total_count, v_total_count, tree_index = (
@@ -1280,10 +1273,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
     def test_beta_diversity_unweighted_unifrac_gpu_engine_falls_back_without_gpu(
         self,
     ):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = beta_diversity(
                 "unweighted_unifrac", self.b1, ids=self.sids1,
                 taxa=self.oids1, tree=self.t1, engine="gpu")
@@ -1295,10 +1285,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
     def test_beta_diversity_weighted_unifrac_gpu_engine_falls_back_without_gpu(
         self,
     ):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = beta_diversity(
                 "weighted_unifrac", self.b1, ids=self.sids1,
                 taxa=self.oids1, tree=self.t1, engine="gpu")
@@ -1310,10 +1297,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
     def test_beta_diversity_generalized_unifrac_gpu_engine_falls_back_without_gpu(
         self,
     ):
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = beta_diversity(
                 "generalized_unifrac", self.b1, ids=self.sids1,
                 taxa=self.oids1, tree=self.t1, engine="gpu", alpha=0.5)
@@ -1322,7 +1306,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         expected = DistanceMatrix(expected_condensed, self.sids1)
         np.testing.assert_allclose(obs.data, expected.data, atol=1e-10)
 
-    def test_unweighted_unifrac_gpu_engine_falls_back_on_kernel_failure(self):
+    def test_weighted_unifrac_gpu_engine_falls_back_on_kernel_failure(self):
         # Even when a GPU backend IS detected, a fused kernel that fails to
         # build/run must fall back to the array-API path rather than
         # propagating the exception (mirrors the PERMANOVA/Mantel
@@ -1330,10 +1314,7 @@ class UnifracTests(QiimeTinyTestMixin, TestCase):
         from skbio.diversity.beta import _unifrac_gpu
 
         self.addCleanup(_unifrac_gpu._unavailable_backends.discard, "cuda")
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value="cuda",
-        ), patch(
+        with patch_gpu_backend("cuda"), patch(
             "skbio.diversity.beta._unifrac_gpu.weighted_unifrac_gpu",
             side_effect=RuntimeError("kernel build failed"),
         ):

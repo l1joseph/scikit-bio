@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 import numpy as np
 
-from skbio import DistanceMatrix
 from skbio.diversity.beta._unifrac_gpu import (
     _KERNEL_CACHE,
     _TILE_CANDIDATES,
@@ -30,6 +29,18 @@ from skbio.diversity.beta._unifrac_gpu import (
     weighted_unifrac_gpu,
 )
 from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
+
+
+def _cleanup_kernel_cache(fake_cuda):
+    """Drop every `_KERNEL_CACHE` entry a fake cuda module may have created.
+
+    Entries are keyed by ``(id(module), tile, node_chunk)``, and a fake
+    module's id can be reused by a later object once it is garbage collected,
+    so its entries must not outlive the test that made them.
+    """
+    for tile, node_chunk in _TILE_CANDIDATES:
+        _KERNEL_CACHE.pop((id(fake_cuda), tile, node_chunk), None)
+
 
 # Measured max abs deviation, GPU vs CPU-numba, across all 12
 # method/normalized/variance_adjust combinations on the qiime-191-tt table:
@@ -63,7 +74,7 @@ class GpuBackendTests(TestCase):
             get_cuda_module()
 
 
-class NumbaOptionalImportTests(TestCase):
+class NumbaOptionalImportTests(QiimeTinyTestMixin, TestCase):
     """`_unifrac_gpu` must stay importable, and `engine='gpu'` reachable via
     the array-API fallback, on a system with no numba installed at all.
 
@@ -127,7 +138,7 @@ class NumbaOptionalImportTests(TestCase):
         self.assertIsNone(fresh_mod.detect_gpu_backend())
 
     def test_gpu_or_xp_dispatch_works_without_numba(self):
-        table, taxa, tree, _ = QiimeTinyTestMixin()._load_qiime_191_tt()
+        table, taxa, tree, _ = self._load_qiime_191_tt()
         fresh_mod = self._load_unifrac_gpu_without_numba()
         # detect_gpu_backend() is None (numba unimportable), so this must use
         # the array-API fallback, not raise.
@@ -231,20 +242,16 @@ class ProbeTileConfigCandidateTests(TestCase):
     actual kernel against tiny dummy data (no GPU required, via
     `_ProbingFakeCuda`)."""
 
-    def _cleanup_kernel_cache(self, fake):
-        for tile, node_chunk in _TILE_CANDIDATES:
-            _KERNEL_CACHE.pop((id(fake), tile, node_chunk), None)
-
     def test_succeeds_silently_when_launch_does_not_raise(self):
         fake = _ProbingFakeCuda(launch_outcomes=[None])
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         # Should not raise.
         _probe_tile_config_candidate(fake, 16, 32)
         self.assertEqual(fake.jit_call_count, 1)
 
     def test_propagates_the_launch_exception(self):
         fake = _ProbingFakeCuda(launch_outcomes=[RuntimeError("boom")])
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         with self.assertRaisesRegex(RuntimeError, "boom"):
             _probe_tile_config_candidate(fake, 32, 32)
 
@@ -257,13 +264,9 @@ class ProbeTileConfigTests(TestCase):
     controlled probes against synthetic data, not user input.
     """
 
-    def _cleanup_kernel_cache(self, fake):
-        for tile, node_chunk in _TILE_CANDIDATES:
-            _KERNEL_CACHE.pop((id(fake), tile, node_chunk), None)
-
     def test_first_candidate_succeeding_is_used_without_trying_others(self):
         fake = _ProbingFakeCuda(launch_outcomes=[None])
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         result = _probe_tile_config(fake, "hip")
         self.assertEqual(result, _TILE_CANDIDATES[0])
         self.assertEqual(fake.jit_call_count, 1)
@@ -276,7 +279,7 @@ class ProbeTileConfigTests(TestCase):
             "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES"
         )
         fake = _ProbingFakeCuda(launch_outcomes=[cuda_error, cuda_error, None, None])
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         result = _probe_tile_config(fake, "cuda")
         self.assertEqual(result, _TILE_CANDIDATES[2])
         self.assertEqual(fake.jit_call_count, 3)
@@ -291,7 +294,7 @@ class ProbeTileConfigTests(TestCase):
             "local memory (66560) exceeds limit (65536)"
         )
         fake = _ProbingFakeCuda(launch_outcomes=[comgr_error, None])
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         result = _probe_tile_config(fake, "hip")
         self.assertEqual(result, _TILE_CANDIDATES[1])
         self.assertEqual(fake.jit_call_count, 2)
@@ -306,7 +309,7 @@ class ProbeTileConfigTests(TestCase):
             None,
         ]
         fake = _ProbingFakeCuda(launch_outcomes=outcomes)
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         result = _probe_tile_config(fake, "cuda")
         self.assertEqual(result, _TILE_CANDIDATES[3])
         self.assertEqual(fake.jit_call_count, 4)
@@ -314,7 +317,7 @@ class ProbeTileConfigTests(TestCase):
     def test_raises_clear_error_when_every_candidate_fails(self):
         fail = RuntimeError("nope")
         fake = _ProbingFakeCuda(launch_outcomes=[fail] * len(_TILE_CANDIDATES))
-        self.addCleanup(self._cleanup_kernel_cache, fake)
+        self.addCleanup(_cleanup_kernel_cache, fake)
         with self.assertRaisesRegex(RuntimeError, "No safe"):
             _probe_tile_config(fake, "cuda")
         self.assertEqual(fake.jit_call_count, len(_TILE_CANDIDATES))
@@ -341,7 +344,7 @@ class GetTileConfigTests(TestCase):
             "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
             return_value=(16, 32),
         ) as mock_probe:
-            result = _get_tile_config("cuda", "fake-cuda-module")
+            result = _get_tile_config("fake-cuda-module", "cuda")
         self.assertEqual(result, (16, 32))
         mock_probe.assert_called_once_with("fake-cuda-module", "cuda")
         self.assertEqual(_TILE_CONFIG_CACHE["cuda"], (16, 32))
@@ -351,8 +354,8 @@ class GetTileConfigTests(TestCase):
             "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
             return_value=(32, 32),
         ) as mock_probe:
-            first = _get_tile_config("hip", "fake-cuda-module")
-            second = _get_tile_config("hip", "fake-cuda-module")
+            first = _get_tile_config("fake-cuda-module", "hip")
+            second = _get_tile_config("fake-cuda-module", "hip")
         self.assertEqual(first, (32, 32))
         self.assertEqual(second, (32, 32))
         mock_probe.assert_called_once()
@@ -365,11 +368,11 @@ class GetTileConfigTests(TestCase):
             "skbio.diversity.beta._unifrac_gpu._probe_tile_config",
             side_effect=fake_probe,
         ) as mock_probe:
-            cuda_result = _get_tile_config("cuda", "fake-cuda-module")
-            hip_result = _get_tile_config("hip", "fake-hip-module")
+            cuda_result = _get_tile_config("fake-cuda-module", "cuda")
+            hip_result = _get_tile_config("fake-hip-module", "hip")
             # Calling again for either backend must not re-probe.
-            _get_tile_config("cuda", "fake-cuda-module")
-            _get_tile_config("hip", "fake-hip-module")
+            _get_tile_config("fake-cuda-module", "cuda")
+            _get_tile_config("fake-hip-module", "hip")
         self.assertEqual(cuda_result, (16, 32))
         self.assertEqual(hip_result, (32, 32))
         self.assertEqual(mock_probe.call_count, 2)
@@ -380,7 +383,7 @@ class GetTileConfigTests(TestCase):
             side_effect=RuntimeError("No safe tile configuration"),
         ) as mock_probe:
             with self.assertRaises(RuntimeError):
-                _get_tile_config("cuda", "fake-cuda-module")
+                _get_tile_config("fake-cuda-module", "cuda")
         self.assertNotIn("cuda", _TILE_CONFIG_CACHE)
         mock_probe.assert_called_once()
 
@@ -395,10 +398,6 @@ class MakeUnifracKernelTests(TestCase):
             @staticmethod
             def jit(func):
                 return func
-
-            @staticmethod
-            def grid(ndim):  # pragma: no cover - never called
-                return 0
 
         return FakeCuda()
 
@@ -428,11 +427,20 @@ class MakeUnifracKernelTests(TestCase):
         )
 
 
-class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
+class _GpuRequiredTestCase(QiimeTinyTestMixin, TestCase):
+    """Base for the fused-kernel correctness tests: needs real GPU hardware.
+
+    Everything else in this module is exercised without a GPU, via fake cuda
+    modules; the classes below launch the real kernel, so they skip when no
+    backend is detected.
+    """
 
     def setUp(self):
         if detect_gpu_backend() is None:
             self.skipTest("no GPU backend available")
+
+
+class WeightedUnifracGpuTests(_GpuRequiredTestCase):
 
     def test_weighted_unifrac_gpu_matches_cpu_unnormalized(self):
         from skbio.diversity.beta._unifrac import _weighted_unifrac_pdist_numba
@@ -469,11 +477,9 @@ class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree,
             normalized=False, variance_adjust=True, validate=True,
         )
-        obs = DistanceMatrix(gpu, sample_ids)
-        expected = self._load_dm_fixture('weighted_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            gpu, sample_ids, 'weighted_unifrac_vaw_dm.txt',
+            GPU_FIXTURE_TOLERANCE)
 
     def test_weighted_unifrac_gpu_matches_fixture_variance_adjusted_normalized(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -481,23 +487,17 @@ class WeightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree,
             normalized=True, variance_adjust=True, validate=True,
         )
-        obs = DistanceMatrix(gpu, sample_ids)
-        expected = self._load_dm_fixture('weighted_normalized_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            gpu, sample_ids, 'weighted_normalized_unifrac_vaw_dm.txt',
+            GPU_FIXTURE_TOLERANCE)
 
 
-class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
+class UnweightedUnifracGpuTests(_GpuRequiredTestCase):
     # unweighted_unifrac's normalized and variance_adjust kwargs are GPU-only
     # in this release (the CPU/numba kernel was reverted to its pre-PR,
     # always-normalized, no-variance_adjust behavior; see CHANGELOG.md), so
     # all four combinations here are checked against the qiime-191-tt SSU
     # fixture distance matrices directly rather than against the CPU kernel.
-
-    def setUp(self):
-        if detect_gpu_backend() is None:
-            self.skipTest("no GPU backend available")
 
     def test_unweighted_unifrac_gpu_matches_fixture_unnormalized(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -505,11 +505,9 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree,
             normalized=False, variance_adjust=False, validate=True,
         )
-        obs = DistanceMatrix(gpu, sample_ids)
-        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            gpu, sample_ids, 'unweighted_unnormalized_unifrac_dm.txt',
+            GPU_FIXTURE_TOLERANCE)
 
     def test_unweighted_unifrac_gpu_matches_fixture_normalized(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -517,11 +515,9 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree,
             normalized=True, variance_adjust=False, validate=True,
         )
-        obs = DistanceMatrix(gpu, sample_ids)
-        expected = self._load_dm_fixture('unweighted_unifrac_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            gpu, sample_ids, 'unweighted_unifrac_dm.txt',
+            GPU_FIXTURE_TOLERANCE)
 
     def test_unweighted_unifrac_gpu_matches_fixture_variance_adjusted_unnormalized(
         self,
@@ -531,12 +527,9 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree,
             normalized=False, variance_adjust=True, validate=True,
         )
-        obs = DistanceMatrix(gpu, sample_ids)
-        expected = self._load_dm_fixture(
-            'unweighted_unnormalized_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            gpu, sample_ids, 'unweighted_unnormalized_unifrac_vaw_dm.txt',
+            GPU_FIXTURE_TOLERANCE)
 
     def test_unweighted_unifrac_gpu_matches_fixture_variance_adjusted_normalized(
         self,
@@ -546,18 +539,12 @@ class UnweightedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree,
             normalized=True, variance_adjust=True, validate=True,
         )
-        obs = DistanceMatrix(gpu, sample_ids)
-        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=GPU_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            gpu, sample_ids, 'unweighted_unifrac_vaw_dm.txt',
+            GPU_FIXTURE_TOLERANCE)
 
 
-class GeneralizedUnifracGpuTests(QiimeTinyTestMixin, TestCase):
-
-    def setUp(self):
-        if detect_gpu_backend() is None:
-            self.skipTest("no GPU backend available")
+class GeneralizedUnifracGpuTests(_GpuRequiredTestCase):
 
     def test_generalized_unifrac_gpu_matches_cpu_alpha_half(self):
         from skbio.diversity.beta._unifrac import _generalized_unifrac_pdist_numba

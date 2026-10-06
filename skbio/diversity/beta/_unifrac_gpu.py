@@ -6,7 +6,14 @@
 # The full license is in the file LICENSE.txt, distributed with this software.
 # ----------------------------------------------------------------------------
 
-"""GPU backend detection for UniFrac (:mod:`skbio.diversity.beta._unifrac_gpu`)."""
+"""GPU UniFrac (:mod:`skbio.diversity.beta._unifrac_gpu`).
+
+Backend detection (``detect_gpu_backend``/``get_cuda_module``), the fused
+Numba CUDA/HIP kernel shared by all five UniFrac methods, the runtime probe
+that picks a safe tile configuration for it, and the ``*_gpu_or_xp``
+wrappers that fall back to :mod:`skbio.diversity.beta._unifrac_xp` when the
+fused kernel is unusable.
+"""
 
 import math
 import threading
@@ -19,200 +26,6 @@ UNWEIGHTED_UNNORMALIZED = 1
 WEIGHTED_NORMALIZED = 2
 WEIGHTED_UNNORMALIZED = 3
 GENERALIZED = 4
-
-# Block-tiling parameters for the 2D node-chunked kernel (see
-# `_make_unifrac_kernel`). A block is (TILE, TILE) threads, i.e. TILE**2
-# threads/block, using 4 shared (TILE, NODE_CHUNK) float64 tiles plus one
-# (NODE_CHUNK,) tile. The safe choice is hardware-specific, not just
-# backend-specific: it depends on the GPU's actual register file and
-# shared-memory budget, which varies across SKUs of the *same* vendor, not
-# only between vendors. There is no reliable way to pick it from a static
-# per-backend table, so it is discovered at runtime instead (see
-# `_get_tile_config`/`_probe_tile_config` below) by actually compiling and
-# launching the real kernel against trivial dummy data.
-#
-# `_TILE_CANDIDATES`, most aggressive (most shared memory, most
-# threads/block, fastest when it works) to least, are real data points from
-# tuning this kernel on specific hardware, not invented, and double as the
-# starting ladder for the runtime probe:
-#   (32, 32): 1024 threads/block, 4*32*32*8 = 32KB shared mem. Fastest
-#       config measured, on AMD MI300A (gfx942) at n_samples=5000 (~12.5M
-#       pairs), median 0.952s. Crashes at kernel *launch* on every NVIDIA
-#       GPU tested (RTX 2080 Ti/Turing, A10/Ampere) with
-#       CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: this kernel's numba-cuda/NVVM
-#       compilation uses more registers/thread at 1024 threads/block than
-#       fit NVIDIA's per-SM register budget, even though the identical
-#       source is fine on AMD's CU register file.
-#   (16, 64): also 1024 threads/block but a narrower, taller shared tile
-#       (4*16*64*8 = 32KB, same total). Measured on AMD MI300A: works, but
-#       slower than (32, 32) (median 1.325s).
-#   (16, 32): 256 threads/block, 4*16*32*8 = 16KB shared mem. The config
-#       known to launch and run correctly on both NVIDIA cards tested
-#       (RTX 2080 Ti, A10); previously the hardcoded NVIDIA default.
-#   (8, 32): 64 threads/block, 4*8*32*8 = 8KB shared mem. A defensive floor
-#       rung below anything actually tuned, for hardware with even tighter
-#       per-block limits than tested (untested itself, but conservative
-#       enough that it should be broadly safe).
-# A real candidate that failed to compile during tuning: (16, 128) on AMD
-# -- "local memory (66560) exceeds limit (65536)" (4 shared tiles of
-# 16*128*8 = 16KB each = 64KB, right at AMD's 64KB LDS/block limit and
-# pushed over by other locals). Not included in the ladder since (32, 32)
-# already dominates it on the one backend where it even compiles.
-_TILE_CANDIDATES = [
-    (32, 32),
-    (16, 64),
-    (16, 32),
-    (8, 32),
-]
-
-# Discovered-safe (TILE, NODE_CHUNK) per backend, filled in by
-# `_get_tile_config` the first time it is called for a given backend.
-# Probing does real compiles/launches (not free), so the result is cached
-# for the rest of the process rather than re-probed on every call. Keyed by
-# backend name ('cuda'/'hip'), not by individual device: a process talks to
-# one GPU backend/vendor at a time in practice, and re-probing per distinct
-# device name would pay the probe cost again for every differently-named
-# card with no real precedent (within this session's tuning) that it would
-# ever choose a different answer on same-vendor hardware.
-_TILE_CONFIG_CACHE = {}
-
-# Guards the check-probe-store sequence in `_get_tile_config`, mirroring
-# `_KERNEL_CACHE_LOCK` below for the same reason: probing is not a hot path
-# (it runs at most once per backend per process), so a single coarse lock
-# is sufficient to stop concurrent callers from redundantly re-probing.
-_TILE_CONFIG_LOCK = threading.Lock()
-
-
-def _probe_tile_config_candidate(cuda, tile, node_chunk):
-    """Compile and launch the real kernel at ``(tile, node_chunk)`` against
-    tiny synthetic dummy data, to see whether this configuration is safe on
-    the GPU actually present.
-
-    Deliberately exercises a real block launch of the *actual*
-    `_make_unifrac_kernel` kernel (not a simplified stand-in), since the
-    failure modes this guards against are specific to that kernel's real
-    register/shared-memory usage: an NVIDIA launch-time resource error, or
-    an AMD compile-time (numba.hip compiles lazily, on first invocation)
-    code-generation error. Both are hardware/compiler failures against
-    data this function constructs itself, not user input, so a broad
-    ``except Exception`` in the caller around this call is intentional and
-    not a validation-error-swallowing bug (contrast
-    `_dispatch_gpu_or_xp`, which narrows deliberately because its inputs
-    *are* user-controlled).
-
-    Raises whatever exception the backend produces; the caller decides
-    whether to try the next candidate.
-    """
-    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
-
-    # Minimal data: 2 samples (one valid i<j pair) and 2 nodes (one real
-    # node-chunk iteration), just enough to exercise one full (tile, tile)
-    # block launch of the real kernel body -- cheap to construct, and the
-    # resource limits this probes for (threads/block, shared-memory/block)
-    # depend only on the launch configuration and compiled kernel, not on
-    # the data size.
-    n_samples = 2
-    n_nodes = 2
-    proportions = np.zeros((n_samples, n_nodes), dtype=np.float64)
-    counts = np.zeros((n_samples, n_nodes), dtype=np.float64)
-    sample_totals = np.zeros(n_samples, dtype=np.float64)
-    branch_lengths = np.zeros(n_nodes, dtype=np.float64)
-    block_i, block_j = _build_block_pair_index(n_samples, tile)
-    n_pairs = n_samples * (n_samples - 1) // 2
-
-    d_proportions = cuda.to_device(proportions)
-    d_counts = cuda.to_device(counts)
-    d_sample_totals = cuda.to_device(sample_totals)
-    d_branch_lengths = cuda.to_device(branch_lengths)
-    d_block_i = cuda.to_device(block_i)
-    d_block_j = cuda.to_device(block_j)
-    d_out = cuda.device_array(max(n_pairs, 1), dtype=np.float64)
-
-    kernel[block_i.shape[0], (tile, tile)](
-        d_proportions,
-        d_counts,
-        d_sample_totals,
-        d_branch_lengths,
-        UNWEIGHTED,
-        1.0,
-        False,
-        d_block_i,
-        d_block_j,
-        n_samples,
-        d_out,
-    )
-    # Forces a synchronize, so a launch-time error (the NVIDIA failure
-    # mode) surfaces here rather than silently later.
-    d_out.copy_to_host()
-
-
-def _probe_tile_config(cuda, backend):
-    """Find the first candidate in `_TILE_CANDIDATES` that actually works
-    on the GPU behind ``cuda``, trying each in order (most aggressive
-    first) and catching both known failure shapes (NVIDIA launch-time,
-    AMD compile-time) plus anything else, since this is a controlled probe
-    against synthetic data, not user input.
-    """
-    failures = []
-    for tile, node_chunk in _TILE_CANDIDATES:
-        try:
-            _probe_tile_config_candidate(cuda, tile, node_chunk)
-            return tile, node_chunk
-        except Exception as exc:  # noqa: BLE001 -- see docstring above
-            failures.append(
-                f"(TILE={tile}, NODE_CHUNK={node_chunk}): {type(exc).__name__}: {exc}"
-            )
-
-    detail = "\n  ".join(failures)
-    # If you land here debugging a real failure: every rung in
-    # _TILE_CANDIDATES above failed on this device, which the ladder was
-    # built to avoid (its smallest rung, (8, 32), is meant to be
-    # conservative enough to not need this). What to do depends on the
-    # error text in `detail` for the *smallest* candidate, (8, 32):
-    #   - "LAUNCH_OUT_OF_RESOURCES" / a register-count complaint (NVIDIA
-    #     shape): this device's register file is smaller than any tested
-    #     so far. Add a new rung below (8, 32) -- e.g. (8, 16) or (4, 32)
-    #     -- to _TILE_CANDIDATES above, in the same most-to-least-aggressive
-    #     order, with a comment recording the device and the real error.
-    #   - "local memory ... exceeds limit" / a shared-memory complaint (AMD
-    #     shape): this device's LDS/shared-memory-per-block budget is
-    #     smaller than 8*32*8*4 = 8KB. Same fix: add a smaller rung, sized
-    #     under that device's real limit (check `detail` for the exact
-    #     numbers the compiler reported).
-    #   - Anything else (an import error, a missing symbol, a totally
-    #     different exception shape): this probably is not a tile-size
-    #     problem at all -- it's more likely a toolchain/driver issue on
-    #     this specific machine. Don't just shrink the ladder in that case;
-    #     investigate why `get_cuda_module()` returned a module that can't
-    #     actually compile this kernel.
-    raise RuntimeError(
-        f"No safe (TILE, NODE_CHUNK) tile configuration could be found for "
-        f"the '{backend}' GPU backend on this device; every candidate in "
-        f"_TILE_CANDIDATES failed to compile or launch:\n  {detail}"
-    )
-
-
-def _get_tile_config(backend, cuda):
-    """Return a (TILE, NODE_CHUNK) pair known to work on this device for
-    ``backend``, probing and caching it on first use.
-
-    Not free the first time (it compiles and launches the real kernel,
-    possibly more than once), so the result is memoized in
-    `_TILE_CONFIG_CACHE` for the rest of the process; later calls for the
-    same backend hit the cache and never re-probe. See `_probe_tile_config`
-    for the probing strategy.
-    """
-    cached = _TILE_CONFIG_CACHE.get(backend)
-    if cached is not None:
-        return cached
-    with _TILE_CONFIG_LOCK:
-        cached = _TILE_CONFIG_CACHE.get(backend)
-        if cached is not None:
-            return cached
-        tile, node_chunk = _probe_tile_config(cuda, backend)
-        _TILE_CONFIG_CACHE[backend] = (tile, node_chunk)
-        return (tile, node_chunk)
-
 
 _backend_cache = None
 
@@ -339,8 +152,9 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
     only one kernel is compiled and launched regardless of which method a given
     driver function dispatches.
 
-    ``tile``/``node_chunk`` (see ``_get_tile_config``) are closed over as
-    compile-time constants, since the two backends need different values.
+    ``tile``/``node_chunk`` are closed over as compile-time constants, since
+    the shared-memory tiles are sized from them; which pair is safe differs
+    per device, so it is discovered at runtime (see ``_get_tile_config``).
 
     ``cuda.jit`` returns a fresh Dispatcher (and so pays full compilation
     cost, seconds) each time this runs, which would otherwise happen on every
@@ -358,7 +172,7 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
         # Imported here, not at module level: this module must stay
         # importable (and the array-API fallback reachable) on a system with
         # no numba installed at all. This function is only ever reached via
-        # `_run_unifrac_kernel`, after `get_cuda_module()` has already
+        # `_launch_unifrac_kernel`, after `get_cuda_module()` has already
         # succeeded, which means some numba variant (numba-cuda or
         # numba.hip, both of which depend on core numba) is installed.
         from numba import float64
@@ -459,7 +273,10 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
                                 continue
                             s = s / vaw
                             d = d / vaw
-                        if method == WEIGHTED_NORMALIZED or method == WEIGHTED_UNNORMALIZED:
+                        if (
+                            method == WEIGHTED_NORMALIZED
+                            or method == WEIGHTED_UNNORMALIZED
+                        ):
                             numerator += length * d
                             denominator += length * s
                         elif method == UNWEIGHTED or method == UNWEIGHTED_UNNORMALIZED:
@@ -498,6 +315,231 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
         return _unifrac_block_kernel
 
 
+def _launch_unifrac_kernel(
+    cuda,
+    tile,
+    node_chunk,
+    proportions,
+    counts_by_node,
+    sample_totals,
+    branch_lengths,
+    method,
+    alpha,
+    variance_adjust,
+):
+    """Upload the inputs, launch the kernel, and return the condensed vector.
+
+    Every array must already be contiguous float64. Shared by
+    ``_run_unifrac_kernel`` and by the tile-config probe below, so the probe
+    exercises exactly the launch path production uses and cannot drift from
+    it.
+    """
+    n_samples = proportions.shape[0]
+    n_pairs = n_samples * (n_samples - 1) // 2
+    block_i, block_j = _build_block_pair_index(n_samples, tile)
+
+    # Bound to locals, not inlined into the launch below: the kernel launch is
+    # asynchronous, so each device array must stay referenced until the
+    # copy_to_host() that synchronizes on it.
+    d_proportions = cuda.to_device(proportions)
+    # For the unweighted methods, `proportions` *is* `counts_by_node` (the
+    # caller needs no division), so reuse the one transfer already made for
+    # `d_proportions` instead of uploading the identical host array twice.
+    if counts_by_node is proportions:
+        d_counts = d_proportions
+    else:
+        d_counts = cuda.to_device(counts_by_node)
+    d_sample_totals = cuda.to_device(sample_totals)
+    d_branch_lengths = cuda.to_device(branch_lengths)
+    d_block_i = cuda.to_device(block_i)
+    d_block_j = cuda.to_device(block_j)
+    d_out = cuda.device_array(n_pairs, dtype=np.float64)
+
+    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
+    kernel[block_i.shape[0], (tile, tile)](
+        d_proportions,
+        d_counts,
+        d_sample_totals,
+        d_branch_lengths,
+        method,
+        alpha,
+        variance_adjust,
+        d_block_i,
+        d_block_j,
+        n_samples,
+        d_out,
+    )
+    return d_out.copy_to_host()
+
+
+# Block-tiling parameters for the 2D node-chunked kernel (see
+# `_make_unifrac_kernel`). A block is (TILE, TILE) threads, i.e. TILE**2
+# threads/block, using 4 shared (TILE, NODE_CHUNK) float64 tiles plus one
+# (NODE_CHUNK,) tile. The safe choice is hardware-specific, not just
+# backend-specific: it depends on the GPU's actual register file and
+# shared-memory budget, which varies across SKUs of the *same* vendor, not
+# only between vendors. There is no reliable way to pick it from a static
+# per-backend table, so it is discovered at runtime instead (see
+# `_get_tile_config`/`_probe_tile_config` below) by actually compiling and
+# launching the real kernel against trivial dummy data.
+#
+# `_TILE_CANDIDATES`, most aggressive (most shared memory, most
+# threads/block, fastest when it works) to least, are real data points from
+# tuning this kernel on specific hardware, not invented, and double as the
+# starting ladder for the runtime probe:
+#   (32, 32): 1024 threads/block, 4*32*32*8 = 32KB shared mem. Fastest
+#       config measured, on AMD MI300A (gfx942) at n_samples=5000 (~12.5M
+#       pairs), median 0.952s. Crashes at kernel *launch* on every NVIDIA
+#       GPU tested (RTX 2080 Ti/Turing, A10/Ampere) with
+#       CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: this kernel's numba-cuda/NVVM
+#       compilation uses more registers/thread at 1024 threads/block than
+#       fit NVIDIA's per-SM register budget, even though the identical
+#       source is fine on AMD's CU register file.
+#   (16, 64): also 1024 threads/block but a narrower, taller shared tile
+#       (4*16*64*8 = 32KB, same total). Measured on AMD MI300A: works, but
+#       slower than (32, 32) (median 1.325s).
+#   (16, 32): 256 threads/block, 4*16*32*8 = 16KB shared mem. The config
+#       known to launch and run correctly on both NVIDIA cards tested
+#       (RTX 2080 Ti, A10); previously the hardcoded NVIDIA default.
+#   (8, 32): 64 threads/block, 4*8*32*8 = 8KB shared mem. A defensive floor
+#       rung below anything actually tuned, for hardware with even tighter
+#       per-block limits than tested (untested itself, but conservative
+#       enough that it should be broadly safe).
+# A real candidate that failed to compile during tuning: (16, 128) on AMD
+# -- "local memory (66560) exceeds limit (65536)" (4 shared tiles of
+# 16*128*8 = 16KB each = 64KB, right at AMD's 64KB LDS/block limit and
+# pushed over by other locals). Not included in the ladder since (32, 32)
+# already dominates it on the one backend where it even compiles.
+_TILE_CANDIDATES = [
+    (32, 32),
+    (16, 64),
+    (16, 32),
+    (8, 32),
+]
+
+# Discovered-safe (TILE, NODE_CHUNK) per backend, filled in by
+# `_get_tile_config` the first time it is called for a given backend.
+# Probing does real compiles/launches (not free), so the result is cached
+# for the rest of the process rather than re-probed on every call. Keyed by
+# backend name ('cuda'/'hip'), not by individual device: a process talks to
+# one GPU backend/vendor at a time in practice, and re-probing per distinct
+# device name would pay the probe cost again for every differently-named
+# card with no real precedent (within this session's tuning) that it would
+# ever choose a different answer on same-vendor hardware.
+_TILE_CONFIG_CACHE = {}
+
+# Guards the check-probe-store sequence in `_get_tile_config`, mirroring
+# `_KERNEL_CACHE_LOCK` above for the same reason: probing is not a hot path
+# (it runs at most once per backend per process), so a single coarse lock
+# is sufficient to stop concurrent callers from redundantly re-probing.
+_TILE_CONFIG_LOCK = threading.Lock()
+
+
+def _probe_tile_config_candidate(cuda, tile, node_chunk):
+    """Compile and launch the real kernel at ``(tile, node_chunk)`` against
+    tiny synthetic dummy data, to see whether this configuration is safe on
+    the GPU actually present.
+
+    Deliberately goes through `_launch_unifrac_kernel`, i.e. a real block
+    launch of the *actual* kernel rather than a simplified stand-in, since
+    the failure modes this guards against are specific to that kernel's real
+    register/shared-memory usage: an NVIDIA launch-time resource error, or
+    an AMD compile-time (numba.hip compiles lazily, on first invocation)
+    code-generation error. The launch ends in a ``copy_to_host()``, which
+    synchronizes, so a launch-time error surfaces here rather than silently
+    later.
+
+    Raises whatever exception the backend produces; the caller decides
+    whether to try the next candidate.
+    """
+    # Minimal data: 2 samples (one valid i<j pair) and 2 nodes (one real
+    # node-chunk iteration), just enough to exercise one full (tile, tile)
+    # block launch of the real kernel body -- cheap to construct, and the
+    # resource limits this probes for (threads/block, shared-memory/block)
+    # depend only on the launch configuration and compiled kernel, not on
+    # the data size.
+    n_samples = 2
+    n_nodes = 2
+    _launch_unifrac_kernel(
+        cuda,
+        tile,
+        node_chunk,
+        np.zeros((n_samples, n_nodes), dtype=np.float64),
+        np.zeros((n_samples, n_nodes), dtype=np.float64),
+        np.zeros(n_samples, dtype=np.float64),
+        np.zeros(n_nodes, dtype=np.float64),
+        UNWEIGHTED,
+        1.0,
+        False,
+    )
+
+
+def _probe_tile_config(cuda, backend):
+    """Find the first candidate in `_TILE_CANDIDATES` that actually works
+    on the GPU behind ``cuda``, trying each in order (most aggressive
+    first) and catching both known failure shapes (NVIDIA launch-time,
+    AMD compile-time) plus anything else, since this is a controlled probe
+    against synthetic data, not user input -- contrast `_dispatch_gpu_or_xp`,
+    whose ``except`` narrows deliberately because its inputs *are*
+    user-controlled.
+    """
+    failures = []
+    for tile, node_chunk in _TILE_CANDIDATES:
+        try:
+            _probe_tile_config_candidate(cuda, tile, node_chunk)
+            return tile, node_chunk
+        except Exception as exc:  # noqa: BLE001 -- see docstring above
+            failures.append(
+                f"(TILE={tile}, NODE_CHUNK={node_chunk}): {type(exc).__name__}: {exc}"
+            )
+
+    detail = "\n  ".join(failures)
+    # If you land here debugging a real failure: every rung in
+    # _TILE_CANDIDATES above failed on this device, which the ladder was
+    # built to avoid (its smallest rung, (8, 32), is meant to be
+    # conservative enough to not need this). What to do depends on the
+    # error text in `detail` for the *smallest* candidate, (8, 32):
+    #   - "LAUNCH_OUT_OF_RESOURCES" / a register-count complaint (NVIDIA
+    #     shape): this device's register file is smaller than any tested
+    #     so far. Add a new rung below (8, 32) -- e.g. (8, 16) or (4, 32)
+    #     -- to _TILE_CANDIDATES above, in the same most-to-least-aggressive
+    #     order, with a comment recording the device and the real error.
+    #   - "local memory ... exceeds limit" / a shared-memory complaint (AMD
+    #     shape): this device's LDS/shared-memory-per-block budget is
+    #     smaller than 8*32*8*4 = 8KB. Same fix: add a smaller rung, sized
+    #     under that device's real limit (check `detail` for the exact
+    #     numbers the compiler reported).
+    #   - Anything else (an import error, a missing symbol, a totally
+    #     different exception shape): this probably is not a tile-size
+    #     problem at all -- it's more likely a toolchain/driver issue on
+    #     this specific machine. Don't just shrink the ladder in that case;
+    #     investigate why `get_cuda_module()` returned a module that can't
+    #     actually compile this kernel.
+    raise RuntimeError(
+        f"No safe (TILE, NODE_CHUNK) tile configuration could be found for "
+        f"the '{backend}' GPU backend on this device; every candidate in "
+        f"_TILE_CANDIDATES failed to compile or launch:\n  {detail}"
+    )
+
+
+def _get_tile_config(cuda, backend):
+    """Return a (TILE, NODE_CHUNK) pair known to work on this device for
+    ``backend``, probing and caching it on first use.
+
+    Not free the first time (it compiles and launches the real kernel,
+    possibly more than once), so the result is memoized in
+    `_TILE_CONFIG_CACHE` for the rest of the process; later calls for the
+    same backend hit the cache and never re-probe. See `_probe_tile_config`
+    for the probing strategy.
+    """
+    with _TILE_CONFIG_LOCK:
+        cached = _TILE_CONFIG_CACHE.get(backend)
+        if cached is None:
+            cached = _probe_tile_config(cuda, backend)
+            _TILE_CONFIG_CACHE[backend] = cached
+        return cached
+
+
 def _run_unifrac_kernel(
     counts, taxa, tree, method, *, alpha=1.0, variance_adjust=False, validate=True
 ):
@@ -522,11 +564,10 @@ def _run_unifrac_kernel(
     counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
         counts, taxa, tree, validate
     )
-    tile, node_chunk = _get_tile_config(detect_gpu_backend(), cuda)
+    tile, node_chunk = _get_tile_config(cuda, detect_gpu_backend())
     counts_by_node = np.ascontiguousarray(counts_by_node, dtype=np.float64)
     tip_indices = _get_tip_indices(tree_index)
     sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
-    n_samples = counts_by_node.shape[0]
     if method in (UNWEIGHTED, UNWEIGHTED_UNNORMALIZED):
         # The unweighted kernel branch only tests "proportions" for > 0
         # (presence/absence), so raw counts can be passed directly in place of
@@ -539,42 +580,18 @@ def _run_unifrac_kernel(
             out=np.zeros_like(counts_by_node),
             where=sample_totals[:, None] > 0,
         )
-    n_pairs = n_samples * (n_samples - 1) // 2
-    block_i, block_j = _build_block_pair_index(n_samples, tile)
-
-    # Bound to locals, not inlined into the launch below: the kernel launch is
-    # asynchronous, so each device array must stay referenced until the
-    # copy_to_host() that synchronizes on it.
-    d_proportions = cuda.to_device(proportions)
-    # For the unweighted methods, `proportions` *is* `counts_by_node` (see
-    # above -- no division needed), so reuse the one transfer already made
-    # for `d_proportions` instead of uploading the identical host array a
-    # second time.
-    if proportions is counts_by_node:
-        d_counts = d_proportions
-    else:
-        d_counts = cuda.to_device(counts_by_node)
-    d_sample_totals = cuda.to_device(sample_totals)
-    d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
-    d_block_i = cuda.to_device(block_i)
-    d_block_j = cuda.to_device(block_j)
-    d_out = cuda.device_array(n_pairs, dtype=np.float64)
-
-    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
-    kernel[block_i.shape[0], (tile, tile)](
-        d_proportions,
-        d_counts,
-        d_sample_totals,
-        d_branch_lengths,
+    return _launch_unifrac_kernel(
+        cuda,
+        tile,
+        node_chunk,
+        proportions,
+        counts_by_node,
+        sample_totals,
+        branch_lengths.astype(np.float64),
         method,
         alpha,
         variance_adjust,
-        d_block_i,
-        d_block_j,
-        n_samples,
-        d_out,
     )
-    return d_out.copy_to_host()
 
 
 def weighted_unifrac_gpu(

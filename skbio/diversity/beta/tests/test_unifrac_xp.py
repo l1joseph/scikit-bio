@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 import numpy as np
 
-from skbio import DistanceMatrix
 from skbio.tree import DuplicateNodeError
 from skbio.diversity.beta._unifrac import (
     _weighted_unifrac_pdist_numba,
@@ -31,7 +30,10 @@ from skbio.diversity.beta._unifrac_xp import (
     unweighted_unifrac_xp,
     weighted_unifrac_xp,
 )
-from skbio.diversity.beta.tests._fixtures import QiimeTinyTestMixin
+from skbio.diversity.beta.tests._fixtures import (
+    QiimeTinyTestMixin,
+    patch_gpu_backend,
+)
 
 # Measured max abs deviation, array-API path vs CPU-numba kernel, for the
 # method/normalized combinations both implement (no variance_adjust) on the
@@ -71,11 +73,8 @@ class WeightedUnifracXpTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree, normalized=False, variance_adjust=True,
             validate=True,
         )
-        obs = DistanceMatrix(xp_res, sample_ids)
-        expected = self._load_dm_fixture('weighted_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=XP_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            xp_res, sample_ids, 'weighted_unifrac_vaw_dm.txt', XP_FIXTURE_TOLERANCE)
 
     def test_weighted_unifrac_xp_matches_fixture_variance_adjusted_normalized(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -83,11 +82,9 @@ class WeightedUnifracXpTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree, normalized=True, variance_adjust=True,
             validate=True,
         )
-        obs = DistanceMatrix(xp_res, sample_ids)
-        expected = self._load_dm_fixture('weighted_normalized_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=XP_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            xp_res, sample_ids, 'weighted_normalized_unifrac_vaw_dm.txt',
+            XP_FIXTURE_TOLERANCE)
 
 
 class UnweightedUnifracXpTests(QiimeTinyTestMixin, TestCase):
@@ -103,11 +100,9 @@ class UnweightedUnifracXpTests(QiimeTinyTestMixin, TestCase):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
         xp_res = unweighted_unifrac_xp(
             table, taxa, tree, normalized=False, validate=True)
-        obs = DistanceMatrix(xp_res, sample_ids)
-        expected = self._load_dm_fixture('unweighted_unnormalized_unifrac_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=XP_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            xp_res, sample_ids, 'unweighted_unnormalized_unifrac_dm.txt',
+            XP_FIXTURE_TOLERANCE)
 
     def test_unweighted_unifrac_xp_matches_fixture_variance_adjusted_unnormalized(
         self,
@@ -117,12 +112,9 @@ class UnweightedUnifracXpTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree, normalized=False, variance_adjust=True,
             validate=True,
         )
-        obs = DistanceMatrix(xp_res, sample_ids)
-        expected = self._load_dm_fixture(
-            'unweighted_unnormalized_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=XP_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            xp_res, sample_ids, 'unweighted_unnormalized_unifrac_vaw_dm.txt',
+            XP_FIXTURE_TOLERANCE)
 
     def test_unweighted_unifrac_xp_matches_fixture_variance_adjusted_normalized(self):
         table, taxa, tree, sample_ids = self._load_qiime_191_tt()
@@ -130,11 +122,8 @@ class UnweightedUnifracXpTests(QiimeTinyTestMixin, TestCase):
             table, taxa, tree, normalized=True, variance_adjust=True,
             validate=True,
         )
-        obs = DistanceMatrix(xp_res, sample_ids)
-        expected = self._load_dm_fixture('unweighted_unifrac_vaw_dm.txt')
-        np.testing.assert_allclose(
-            obs.filter(sample_ids).data, expected.filter(sample_ids).data,
-            rtol=0, atol=XP_FIXTURE_TOLERANCE)
+        self._assert_matches_dm_fixture(
+            xp_res, sample_ids, 'unweighted_unifrac_vaw_dm.txt', XP_FIXTURE_TOLERANCE)
 
 
 class GeneralizedUnifracXpTests(QiimeTinyTestMixin, TestCase):
@@ -185,10 +174,7 @@ class GpuOrXpDispatchTests(QiimeTinyTestMixin, TestCase):
 
     def test_weighted_unifrac_gpu_or_xp_falls_back_without_gpu(self):
         table, taxa, tree, _ = self._load_qiime_191_tt()
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = weighted_unifrac_gpu_or_xp(
                 table, taxa, tree, normalized=True, validate=True)
         cpu = _weighted_unifrac_pdist_numba(
@@ -197,10 +183,7 @@ class GpuOrXpDispatchTests(QiimeTinyTestMixin, TestCase):
 
     def test_unweighted_unifrac_gpu_or_xp_falls_back_without_gpu(self):
         table, taxa, tree, _ = self._load_qiime_191_tt()
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = unweighted_unifrac_gpu_or_xp(
                 table, taxa, tree, normalized=True, validate=True)
         cpu = _unweighted_unifrac_pdist_numba(table, taxa, tree, validate=True)
@@ -211,10 +194,7 @@ class GpuOrXpDispatchTests(QiimeTinyTestMixin, TestCase):
         # public API, so this does not raise when no GPU backend is usable
         # -- it is the regression this whole fallback exists to fix.
         table, taxa, tree, _ = self._load_qiime_191_tt()
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value=None,
-        ):
+        with patch_gpu_backend(None):
             obs = generalized_unifrac_gpu_or_xp(
                 table, taxa, tree, alpha=0.5, validate=True)
         cpu = _generalized_unifrac_pdist_numba(
@@ -245,10 +225,7 @@ class DispatchValidationErrorTests(QiimeTinyTestMixin, TestCase):
         def xp_func(*args, **kwargs):
             raise AssertionError("xp_func must not be reached")
 
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value="hip",
-        ):
+        with patch_gpu_backend("hip"):
             with self.assertRaises(ValueError):
                 _dispatch_gpu_or_xp(bad_gpu_func, xp_func)
         self.assertNotIn("hip", _unavailable_backends)
@@ -260,10 +237,7 @@ class DispatchValidationErrorTests(QiimeTinyTestMixin, TestCase):
         def xp_func(*args, **kwargs):
             raise AssertionError("xp_func must not be reached")
 
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value="hip",
-        ):
+        with patch_gpu_backend("hip"):
             with self.assertRaises(DuplicateNodeError):
                 _dispatch_gpu_or_xp(bad_gpu_func, xp_func)
         self.assertNotIn("hip", _unavailable_backends)
@@ -279,10 +253,7 @@ class DispatchValidationErrorTests(QiimeTinyTestMixin, TestCase):
         def xp_func(*args, **kwargs):
             return "xp result"
 
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value="hip",
-        ):
+        with patch_gpu_backend("hip"):
             with self.assertWarns(UserWarning):
                 obs = _dispatch_gpu_or_xp(bad_gpu_func, xp_func)
         self.assertEqual(obs, "xp result")
@@ -305,10 +276,7 @@ class DispatchValidationErrorTests(QiimeTinyTestMixin, TestCase):
         duplicate_taxa = list(taxa)
         duplicate_taxa[1] = duplicate_taxa[0]
 
-        with patch(
-            "skbio.diversity.beta._unifrac_gpu.detect_gpu_backend",
-            return_value="hip",
-        ), patch(
+        with patch_gpu_backend("hip"), patch(
             "skbio.diversity.beta._unifrac_gpu.get_cuda_module",
             return_value=object(),
         ), patch(
