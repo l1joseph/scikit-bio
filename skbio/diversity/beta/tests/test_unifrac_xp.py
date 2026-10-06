@@ -308,6 +308,48 @@ class DispatchValidationErrorTests(QiimeTinyTestMixin, TestCase):
             )
             np.testing.assert_allclose(obs, cpu, rtol=0, atol=XP_CPU_TOLERANCE)
 
+    def test_invalid_taxa_under_engine_gpu_validate_false_raises_and_keeps_usable(
+        self,
+    ):
+        # Same contract as the validate=True test above, but for
+        # validate=False: skipping `_validate_taxa_and_tree` means a
+        # taxon absent from the tree is never caught by that check, so it
+        # instead surfaces as a plain `KeyError` from `_nodes_by_counts`
+        # (via `vectorize_counts_and_tree`/`_setup_multiple_unifrac`),
+        # confirmed by tracing the real call chain -- not a `ValueError`/
+        # `TreeError`. This must still be re-raised immediately rather than
+        # misclassified as "this backend's kernel can't run" (which would
+        # hide the error and permanently degrade the backend).
+        table, taxa, tree, _ = self._load_qiime_191_tt()
+        mismatched_taxa = list(taxa)
+        mismatched_taxa[0] = "not-a-real-tip-name"
+
+        with patch_gpu_backend("hip"), patch(
+            "skbio.diversity.beta._unifrac_gpu.get_cuda_module",
+            return_value=object(),
+        ), patch(
+            "skbio.diversity.beta._unifrac_gpu.weighted_unifrac_gpu",
+            wraps=weighted_unifrac_gpu,
+        ) as spy_gpu_func:
+            with self.assertRaises(KeyError):
+                weighted_unifrac_gpu_or_xp(
+                    table, mismatched_taxa, tree, normalized=True, validate=False
+                )
+            self.assertNotIn("hip", _unavailable_backends)
+            self.assertEqual(spy_gpu_func.call_count, 1)
+
+            # A second, valid request on the still-usable backend must still
+            # attempt the real kernel driver, exactly as in the validate=True
+            # test above.
+            obs = weighted_unifrac_gpu_or_xp(
+                table, taxa, tree, normalized=True, validate=True
+            )
+            self.assertEqual(spy_gpu_func.call_count, 2)
+            cpu = _weighted_unifrac_pdist_numba(
+                table, taxa, tree, normalized=True, validate=True
+            )
+            np.testing.assert_allclose(obs, cpu, rtol=0, atol=XP_CPU_TOLERANCE)
+
 
 if __name__ == "__main__":
     main()

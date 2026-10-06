@@ -256,6 +256,47 @@ class ProbeTileConfigCandidateTests(TestCase):
             _probe_tile_config_candidate(fake, 32, 32)
 
 
+class LaunchUnifracKernelEvictsFailedCacheEntryTests(TestCase):
+    """`_make_unifrac_kernel` caches a compiled kernel before it is ever
+    launched, so a candidate that compiles fine but fails at launch time
+    (the NVIDIA tile-probe failure mode) must not leave a dead entry behind
+    in `_KERNEL_CACHE` -- a small per-process leak of a reference to the
+    CUDA module and a broken Dispatcher. `_launch_unifrac_kernel` (driven
+    here via `_probe_tile_config_candidate`, same as the probe) must evict
+    that entry before re-raising.
+    """
+
+    def test_failed_launch_does_not_linger_in_kernel_cache(self):
+        fake = _ProbingFakeCuda(launch_outcomes=[RuntimeError("boom")])
+        self.addCleanup(_cleanup_kernel_cache, fake)
+        cache_key = (id(fake), 16, 32)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            _probe_tile_config_candidate(fake, 16, 32)
+        self.assertNotIn(cache_key, _KERNEL_CACHE)
+
+    def test_successful_launch_still_caches_the_kernel(self):
+        # Sanity check for the other side of the fix: a candidate that
+        # actually works must still end up cached (eviction must only
+        # trigger on failure).
+        fake = _ProbingFakeCuda(launch_outcomes=[None])
+        self.addCleanup(_cleanup_kernel_cache, fake)
+        cache_key = (id(fake), 16, 32)
+        _probe_tile_config_candidate(fake, 16, 32)
+        self.assertIn(cache_key, _KERNEL_CACHE)
+
+    def test_later_retry_after_a_failed_launch_recompiles_rather_than_reusing(self):
+        # With the dead entry evicted, a later attempt at the same
+        # (tile, node_chunk) must recompile (a fresh `.jit()` call) instead
+        # of returning the broken cached Dispatcher.
+        fake = _ProbingFakeCuda(launch_outcomes=[RuntimeError("boom"), None])
+        self.addCleanup(_cleanup_kernel_cache, fake)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            _probe_tile_config_candidate(fake, 16, 32)
+        self.assertEqual(fake.jit_call_count, 1)
+        _probe_tile_config_candidate(fake, 16, 32)
+        self.assertEqual(fake.jit_call_count, 2)
+
+
 class ProbeTileConfigTests(TestCase):
     """`_probe_tile_config` walks `_TILE_CANDIDATES` in order and returns
     the first one that actually works, handling both known failure shapes

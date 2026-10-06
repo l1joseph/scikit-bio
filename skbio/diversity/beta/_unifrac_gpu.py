@@ -356,20 +356,45 @@ def _launch_unifrac_kernel(
     d_out = cuda.device_array(n_pairs, dtype=np.float64)
 
     kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
-    kernel[block_i.shape[0], (tile, tile)](
-        d_proportions,
-        d_counts,
-        d_sample_totals,
-        d_branch_lengths,
-        method,
-        alpha,
-        variance_adjust,
-        d_block_i,
-        d_block_j,
-        n_samples,
-        d_out,
-    )
-    return d_out.copy_to_host()
+    try:
+        kernel[block_i.shape[0], (tile, tile)](
+            d_proportions,
+            d_counts,
+            d_sample_totals,
+            d_branch_lengths,
+            method,
+            alpha,
+            variance_adjust,
+            d_block_i,
+            d_block_j,
+            n_samples,
+            d_out,
+        )
+        return d_out.copy_to_host()
+    except Exception:
+        # `_make_unifrac_kernel` caches the compiled kernel before it is
+        # ever launched, so a candidate that compiles fine but fails here
+        # (the NVIDIA tile-probe failure mode: launch-time
+        # LAUNCH_OUT_OF_RESOURCES) would otherwise leave a cached-but-
+        # unusable entry -- holding a reference to the CUDA module and a
+        # broken Dispatcher -- for the rest of the process. Evict it so a
+        # failed candidate does not linger; nothing else looks up this
+        # specific (tile, node_chunk) key again once probing has moved on
+        # (`_get_tile_config` only returns the config that actually worked).
+        _evict_kernel_cache_entry(cuda, tile, node_chunk)
+        raise
+
+
+def _evict_kernel_cache_entry(cuda, tile, node_chunk):
+    """Remove ``(id(cuda), tile, node_chunk)`` from ``_KERNEL_CACHE``, if present.
+
+    See the ``except`` clause in ``_launch_unifrac_kernel`` for why this is
+    needed: a kernel is cached as soon as it compiles, before it is ever
+    launched.
+    """
+    cache_key = (id(cuda), tile, node_chunk)
+    with _KERNEL_CACHE_LOCK:
+        _KERNEL_CACHE.pop(cache_key, None)
 
 
 # Block-tiling parameters for the 2D node-chunked kernel (see
@@ -540,6 +565,27 @@ def _get_tile_config(cuda, backend):
         return cached
 
 
+class _ValidationFailure(Exception):
+    """Internal marker: wraps whatever ``_setup_multiple_unifrac`` raised for
+    bad ``counts``/``taxa``/``tree`` input, before any GPU-specific code ran.
+
+    ``_dispatch_gpu_or_xp`` catches this to re-raise the original exception
+    immediately, without marking the GPU backend unavailable. The signal
+    this relies on is *position* (raised only around the validation call,
+    which never touches the GPU), not the original exception's type -- a
+    type-based allowlist is not safe here, since the real exception for bad
+    input varies (``ValueError``/``TreeError`` under ``validate=True``,
+    plain ``KeyError`` from ``_nodes_by_counts`` under ``validate=False``
+    for mismatched taxa/tree) and at least ``KeyError`` is also a plausible
+    failure mode from unrelated numba/CUDA-driver internals during genuine
+    kernel compilation or launch.
+    """
+
+    def __init__(self, original):
+        self.original = original
+        super().__init__(str(original))
+
+
 def _run_unifrac_kernel(
     counts, taxa, tree, method, *, alpha=1.0, variance_adjust=False, validate=True
 ):
@@ -556,14 +602,24 @@ def _run_unifrac_kernel(
     # Validate before any GPU-specific code, including tile-config probing:
     # probing now does a real compile+launch against this device (unlike
     # the old fixed-dict lookup), so it must not run ahead of input
-    # validation -- a bad `taxa`/`tree` should surface its own
-    # ValueError/TreeError immediately, not after paying for a wasted probe
-    # (or worse, a probe failure masking the real validation error; see
-    # `_dispatch_gpu_or_xp`'s docstring on why those two must not be
-    # conflated).
-    counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
-        counts, taxa, tree, validate
-    )
+    # validation -- a bad `taxa`/`tree` should surface its own error
+    # immediately, not after paying for a wasted probe (or worse, a probe
+    # failure masking the real validation error). `_setup_multiple_unifrac`
+    # never touches the GPU, so anything it raises here -- a `ValueError`/
+    # `TreeError` under `validate=True`, or a plain `KeyError` from
+    # `_nodes_by_counts` for mismatched taxa under `validate=False` -- is by
+    # construction an input problem, not a kernel/hardware one. Wrap it so
+    # `_dispatch_gpu_or_xp` can tell the two apart by *where* the exception
+    # came from rather than by its type (see `_ValidationFailure` and
+    # `_dispatch_gpu_or_xp`'s docstring: exception type alone is not a safe
+    # signal, since e.g. `KeyError` could also plausibly come from the real
+    # GPU kernel/launch machinery for an unrelated reason).
+    try:
+        counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
+            counts, taxa, tree, validate
+        )
+    except Exception as exc:
+        raise _ValidationFailure(exc) from exc
     tile, node_chunk = _get_tile_config(cuda, detect_gpu_backend())
     counts_by_node = np.ascontiguousarray(counts_by_node, dtype=np.float64)
     tip_indices = _get_tip_indices(tree_index)
@@ -677,6 +733,13 @@ def generalized_unifrac_gpu(
 # UniFrac-local equivalent is used here rather than reusing that helper.)
 _unavailable_backends = set()
 
+# Guards the check-then-add in `_mark_backend_unavailable` and the
+# check-then-attempt in `_dispatch_gpu_or_xp`, mirroring `_KERNEL_CACHE_LOCK`/
+# `_TILE_CONFIG_LOCK` above for the same reason: without it, two concurrent
+# callers could both pass the `not in` check and both attempt the failing
+# GPU path (or both emit the "kernel could not be used" warning).
+_UNAVAILABLE_BACKENDS_LOCK = threading.Lock()
+
 
 def _mark_backend_unavailable(backend):
     """Record that ``backend``'s fused UniFrac kernel cannot run this process.
@@ -686,8 +749,13 @@ def _mark_backend_unavailable(backend):
     stack). Warns once per backend, then routes that backend to the
     array-API fallback from then on.
     """
-    if backend not in _unavailable_backends:
-        _unavailable_backends.add(backend)
+    with _UNAVAILABLE_BACKENDS_LOCK:
+        if backend not in _unavailable_backends:
+            _unavailable_backends.add(backend)
+            should_warn = True
+        else:
+            should_warn = False
+    if should_warn:
         warn(
             f"The fused UniFrac GPU kernel could not be used for the "
             f"'{backend}' backend on this system; using the array-API "
@@ -702,22 +770,37 @@ def _dispatch_gpu_or_xp(gpu_func, xp_func, *args, **kwargs):
     An exception out of the fused kernel marks its backend unavailable for
     the rest of the process and falls through to the array-API path, so one
     bad kernel build degrades performance rather than failing the call --
-    *except* for input-validation errors (``ValueError`` and the
-    ``skbio.tree.TreeError`` family, e.g. ``MissingNodeError``/
-    ``DuplicateNodeError``), which ``gpu_func`` raises from its own
-    ``_setup_multiple_unifrac`` call before any GPU-specific code runs.
-    Those are the caller's fault, not the backend's, so they are re-raised
-    immediately rather than being misclassified as "this backend's kernel
-    can't run" -- which would both hide the real error behind a fallback
-    and permanently (for the rest of the process) degrade every later call
-    to the slow array-API path over one bad input.
+    *except* for input-validation failures. There are two ways ``gpu_func``
+    surfaces one of those:
+
+    - Wrapped in ``_ValidationFailure``, when ``gpu_func`` is one of the real
+      ``*_unifrac_gpu`` drivers: ``_run_unifrac_kernel`` wraps whatever its
+      own ``_setup_multiple_unifrac`` call raises before any GPU-specific
+      code runs. See ``_ValidationFailure`` for why this is keyed off
+      *where* the exception came from rather than its type (a type-based
+      allowlist is not safe for every shape a validation error can take,
+      e.g. plain ``KeyError`` under ``validate=False``).
+    - A bare ``ValueError``/``skbio.tree.TreeError``, for any other
+      ``gpu_func`` (e.g. in tests exercising this dispatcher directly) that
+      raises one of those two types itself.
+
+    Either way, these are the caller's fault, not the backend's, so the
+    original exception is re-raised immediately rather than being
+    misclassified as "this backend's kernel can't run" -- which would both
+    hide the real error behind a fallback and permanently (for the rest of
+    the process) degrade every later call to the slow array-API path over
+    one bad input.
     """
     from skbio.tree import TreeError
 
     backend = detect_gpu_backend()
-    if backend is not None and backend not in _unavailable_backends:
+    with _UNAVAILABLE_BACKENDS_LOCK:
+        backend_usable = backend is not None and backend not in _unavailable_backends
+    if backend_usable:
         try:
             return gpu_func(*args, **kwargs)
+        except _ValidationFailure as exc:
+            raise exc.original from None
         except (ValueError, TreeError):
             raise
         except Exception:
