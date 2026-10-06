@@ -59,7 +59,7 @@ _qualitative_metrics = {
 }
 
 # Names of beta diversity callables that have a faster string-keyed equivalent.
-_slow_beta_callables = {"unweighted_unifrac", "weighted_unifrac"}
+_slow_beta_callables = {"unweighted_unifrac", "weighted_unifrac", "generalized_unifrac"}
 
 
 # Beta diversity metrics implemented in SciPy's pdist.
