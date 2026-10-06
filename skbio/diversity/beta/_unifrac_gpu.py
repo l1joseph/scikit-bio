@@ -164,6 +164,27 @@ def _probe_tile_config(cuda, backend):
             )
 
     detail = "\n  ".join(failures)
+    # If you land here debugging a real failure: every rung in
+    # _TILE_CANDIDATES above failed on this device, which the ladder was
+    # built to avoid (its smallest rung, (8, 32), is meant to be
+    # conservative enough to not need this). What to do depends on the
+    # error text in `detail` for the *smallest* candidate, (8, 32):
+    #   - "LAUNCH_OUT_OF_RESOURCES" / a register-count complaint (NVIDIA
+    #     shape): this device's register file is smaller than any tested
+    #     so far. Add a new rung below (8, 32) -- e.g. (8, 16) or (4, 32)
+    #     -- to _TILE_CANDIDATES above, in the same most-to-least-aggressive
+    #     order, with a comment recording the device and the real error.
+    #   - "local memory ... exceeds limit" / a shared-memory complaint (AMD
+    #     shape): this device's LDS/shared-memory-per-block budget is
+    #     smaller than 8*32*8*4 = 8KB. Same fix: add a smaller rung, sized
+    #     under that device's real limit (check `detail` for the exact
+    #     numbers the compiler reported).
+    #   - Anything else (an import error, a missing symbol, a totally
+    #     different exception shape): this probably is not a tile-size
+    #     problem at all -- it's more likely a toolchain/driver issue on
+    #     this specific machine. Don't just shrink the ladder in that case;
+    #     investigate why `get_cuda_module()` returned a module that can't
+    #     actually compile this kernel.
     raise RuntimeError(
         f"No safe (TILE, NODE_CHUNK) tile configuration could be found for "
         f"the '{backend}' GPU backend on this device; every candidate in "
