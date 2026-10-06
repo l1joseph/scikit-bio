@@ -32,6 +32,12 @@ except ImportError:
 # change in this default value.
 _normalize_weighted_unifrac_by_default = False
 
+# Raised by both generalized_unifrac and beta_diversity for the CPU path.
+_GENERALIZED_UNIFRAC_GPU_ONLY = (
+    "generalized_unifrac currently requires a GPU (engine='gpu'). "
+    "CPU support is planned for a future release."
+)
+
 
 def _validate_unifrac_engine(engine):
     """Reject engine values the single-pair UniFrac functions cannot honor.
@@ -42,6 +48,39 @@ def _validate_unifrac_engine(engine):
     """
     if engine not in (None, "gpu"):
         raise ValueError(f"engine must be None or 'gpu', got {engine!r}.")
+
+
+def _reject_gpu_only_options(metric, *, normalized=True, variance_adjust=False):
+    """Reject UniFrac options that only ``engine='gpu'`` implements.
+
+    ``variance_adjust`` (both metrics) and ``normalized=False`` (unweighted
+    only) have no CPU implementation in this release. Shared by the
+    single-pair functions here and by ``beta_diversity`` so both reject them
+    with the same message.
+    """
+    if variance_adjust:
+        raise NotImplementedError(
+            f"variance_adjust=True for {metric} currently requires "
+            "engine='gpu'. CPU support is planned for a future release."
+        )
+    if not normalized:
+        raise NotImplementedError(
+            f"normalized=False for {metric} currently requires engine='gpu'. "
+            "CPU support is planned for a future release."
+        )
+
+
+def _unifrac_pair_via_pdist(pdist_func, u_counts, v_counts, taxa, tree, **options):
+    """Compute one pair's UniFrac distance through a condensed pdist driver.
+
+    Single-pair GPU dispatch is wasteful (kernel launch overhead for one
+    pair), so this routes through the same driver ``beta_diversity`` uses,
+    with a 2-row input whose only pair is the one asked for. The driver uses
+    the fused GPU kernel when a usable backend is detected and the array-API
+    implementation otherwise.
+    """
+    counts = np.vstack([u_counts, v_counts])
+    return pdist_func(counts, taxa, tree, **options)[0]
 
 
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
@@ -200,31 +239,19 @@ def unweighted_unifrac(
     if engine == "gpu":
         from skbio.diversity.beta._unifrac_gpu import unweighted_unifrac_gpu_or_xp
 
-        # Single-pair GPU dispatch is wasteful (kernel launch overhead for
-        # one pair); route through the same pdist driver beta_diversity
-        # uses, with a 2-row input. Uses the fused GPU kernel when a usable
-        # backend is detected, falling back to the array-API implementation
-        # otherwise.
-        counts = np.vstack([u_counts, v_counts])
-        distances = unweighted_unifrac_gpu_or_xp(
-            counts,
+        return _unifrac_pair_via_pdist(
+            unweighted_unifrac_gpu_or_xp,
+            u_counts,
+            v_counts,
             taxa,
             tree,
             normalized=normalized,
             variance_adjust=variance_adjust,
             validate=validate,
         )
-        return distances[0]
-    if variance_adjust:
-        raise NotImplementedError(
-            "variance_adjust=True for unweighted_unifrac currently requires "
-            "engine='gpu'. CPU support is planned for a future release."
-        )
-    if not normalized:
-        raise NotImplementedError(
-            "normalized=False for unweighted_unifrac currently requires "
-            "engine='gpu'. CPU support is planned for a future release."
-        )
+    _reject_gpu_only_options(
+        "unweighted_unifrac", normalized=normalized, variance_adjust=variance_adjust
+    )
     u_node_counts, v_node_counts, _, _, tree_index = _setup_pairwise_unifrac(
         u_counts, v_counts, taxa, tree, validate, normalized=False, unweighted=True
     )
@@ -385,21 +412,18 @@ def weighted_unifrac(
     if engine == "gpu":
         from skbio.diversity.beta._unifrac_gpu import weighted_unifrac_gpu_or_xp
 
-        # Single-pair GPU dispatch is wasteful (kernel launch overhead for
-        # one pair); route through the same pdist driver beta_diversity
-        # uses, with a 2-row input. Uses the fused GPU kernel when a usable
-        # backend is detected, falling back to the array-API implementation
-        # otherwise.
-        counts = np.vstack([u_counts, v_counts])
-        distances = weighted_unifrac_gpu_or_xp(
-            counts,
+        return _unifrac_pair_via_pdist(
+            weighted_unifrac_gpu_or_xp,
+            u_counts,
+            v_counts,
             taxa,
             tree,
             normalized=normalized,
             variance_adjust=variance_adjust,
             validate=validate,
         )
-        return distances[0]
+    # Rejected before the setup work below, as in unweighted_unifrac.
+    _reject_gpu_only_options("weighted_unifrac", variance_adjust=variance_adjust)
     (
         u_node_counts,
         v_node_counts,
@@ -417,11 +441,6 @@ def weighted_unifrac(
     )
     branch_lengths = tree_index["length"]
 
-    if variance_adjust:
-        raise NotImplementedError(
-            "variance_adjust=True for weighted_unifrac currently requires "
-            "engine='gpu'. CPU support is planned for a future release."
-        )
     if normalized:
         tip_indices = _get_tip_indices(tree_index)
         node_to_root_distances = _tip_distances(branch_lengths, tree, tip_indices)
@@ -1169,28 +1188,23 @@ def generalized_unifrac(
     """
     _validate_unifrac_engine(engine)
     if engine != "gpu":
-        raise NotImplementedError(
-            "generalized_unifrac currently requires a GPU (engine='gpu'); "
-            "CPU support is planned for a future release."
-        )
-    from skbio.diversity.beta._unifrac_gpu import generalized_unifrac_gpu_or_xp
-
+        # Deliberately before the alpha-range check below, so that an
+        # unavailable implementation is reported ahead of a bad parameter.
+        raise NotImplementedError(_GENERALIZED_UNIFRAC_GPU_ONLY)
     if not (0.0 <= alpha <= 1.0):
         raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
-    # Single-pair GPU dispatch is wasteful (kernel launch overhead for one
-    # pair); route through the same pdist driver beta_diversity uses, with
-    # a 2-row input. Uses the fused GPU kernel when a usable backend is
-    # detected, falling back to the array-API implementation otherwise.
-    counts = np.vstack([u_counts, v_counts])
-    distances = generalized_unifrac_gpu_or_xp(
-        counts,
+    from skbio.diversity.beta._unifrac_gpu import generalized_unifrac_gpu_or_xp
+
+    return _unifrac_pair_via_pdist(
+        generalized_unifrac_gpu_or_xp,
+        u_counts,
+        v_counts,
         taxa,
         tree,
         alpha=alpha,
         variance_adjust=variance_adjust,
         validate=validate,
     )
-    return distances[0]
 
 
 if NUMBA_AVAILABLE:

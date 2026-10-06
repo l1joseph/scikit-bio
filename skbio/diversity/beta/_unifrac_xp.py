@@ -58,7 +58,6 @@ def _variance_adjust_terms(xp, counts_i, counts_block, sample_totals, i):
         Where ``vaw > 0``.
 
     """
-    n_remaining = counts_block.shape[0]
     m = sample_totals[i] + sample_totals[i + 1 :]  # (n_remaining,)
     mi = counts_i[None, :] + counts_block  # (n_remaining, n_nodes)
     arg = mi * (m[:, None] - mi)
@@ -72,6 +71,15 @@ def _safe_divide(xp, numer, denom, valid):
     """``numer / denom`` where ``valid``, else ``0``; avoids 0-division warnings."""
     safe_denom = xp.where(valid, denom, xp.asarray(1.0, dtype=denom.dtype))
     return xp.where(valid, numer / safe_denom, xp.asarray(0.0, dtype=numer.dtype))
+
+
+def _normalize(xp, numerator, denominator):
+    """``numerator / denominator``, or ``0`` where the denominator vanishes.
+
+    Matches the fused kernel's final ``0.0 if denominator == 0.0 else
+    numerator / denominator``.
+    """
+    return _safe_divide(xp, numerator, denominator, denominator != 0)
 
 
 def _weighted_unifrac_xp_core(
@@ -100,15 +108,7 @@ def _weighted_unifrac_xp_core(
         denominator = xp.sum(branch_lengths[None, :] * s, axis=-1)
 
         if normalized:
-            result = xp.where(
-                denominator == 0,
-                xp.asarray(0.0, dtype=denominator.dtype),
-                numerator / xp.where(
-                    denominator == 0,
-                    xp.asarray(1.0, dtype=denominator.dtype),
-                    denominator,
-                ),
-            )
+            result = _normalize(xp, numerator, denominator)
         else:
             result = numerator
 
@@ -137,19 +137,12 @@ def _unweighted_unifrac_xp_core(
             vaw, vaw_valid = _variance_adjust_terms(
                 xp, p_u, p_v, sample_totals, i,
             )
-            gate = observed & vaw_valid
-            safe_vaw = xp.where(
-                gate, vaw, xp.asarray(1.0, dtype=vaw.dtype)
-            )
-            length_term = xp.where(
-                gate,
-                branch_lengths[None, :] / safe_vaw,
-                xp.asarray(0.0, dtype=vaw.dtype),
+            length_term = _safe_divide(
+                xp, branch_lengths[None, :], vaw, observed & vaw_valid
             )
         else:
-            gate = observed
             length_term = xp.where(
-                gate,
+                observed,
                 branch_lengths[None, :],
                 xp.asarray(0.0, dtype=branch_lengths.dtype),
             )
@@ -161,15 +154,7 @@ def _unweighted_unifrac_xp_core(
         denominator = xp.sum(length_term, axis=-1)
 
         if normalized:
-            result = xp.where(
-                denominator == 0,
-                xp.asarray(0.0, dtype=denominator.dtype),
-                numerator / xp.where(
-                    denominator == 0,
-                    xp.asarray(1.0, dtype=denominator.dtype),
-                    denominator,
-                ),
-            )
+            result = _normalize(xp, numerator, denominator)
         else:
             result = numerator
 
@@ -210,21 +195,12 @@ def _generalized_unifrac_xp_core(
             branch_lengths[None, :] * safe_s**alpha,
             xp.asarray(0.0, dtype=s.dtype),
         )
-        numerator = xp.sum(
-            xp.where(gate, sum_pow * (d / safe_s), xp.asarray(0.0, dtype=s.dtype)),
-            axis=-1,
-        )
+        # sum_pow is already exactly 0 outside `gate`, and d / safe_s is finite
+        # everywhere, so the gated nodes drop out of this sum on their own.
+        numerator = xp.sum(sum_pow * (d / safe_s), axis=-1)
         denominator = xp.sum(sum_pow, axis=-1)
 
-        result = xp.where(
-            denominator == 0,
-            xp.asarray(0.0, dtype=denominator.dtype),
-            numerator / xp.where(
-                denominator == 0,
-                xp.asarray(1.0, dtype=denominator.dtype),
-                denominator,
-            ),
-        )
+        result = _normalize(xp, numerator, denominator)
 
         offset = _condensed_offset(i, n_samples)
         out[offset : offset + result.shape[0]] = result
@@ -247,15 +223,8 @@ def _prepare(counts, taxa, tree, validate):
     xp, counts_by_node, sample_totals, branch_lengths = ingest_array(
         counts_by_node, sample_totals, branch_lengths
     )
-    proportions = xp.where(
-        sample_totals[:, None] > 0,
-        counts_by_node / xp.where(
-            sample_totals[:, None] > 0,
-            sample_totals[:, None],
-            xp.asarray(1.0, dtype=counts_by_node.dtype),
-        ),
-        xp.asarray(0.0, dtype=counts_by_node.dtype),
-    )
+    totals = sample_totals[:, None]
+    proportions = _safe_divide(xp, counts_by_node, totals, totals > 0)
     return xp, counts_by_node, sample_totals, branch_lengths, proportions
 
 

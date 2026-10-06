@@ -334,16 +334,15 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
     return _unifrac_block_kernel
 
 
-def weighted_unifrac_gpu(
-    counts, taxa, tree, normalized, variance_adjust=False, validate=True
+def _run_unifrac_kernel(
+    counts, taxa, tree, method, *, alpha=1.0, variance_adjust=False, validate=True
 ):
-    """Compute the condensed weighted UniFrac distance vector on a GPU.
+    """Launch the fused kernel and return the condensed distance vector.
 
-    Host-side driver for the weighted UniFrac methods (``normalized`` selects
-    between ``WEIGHTED_NORMALIZED`` and ``WEIGHTED_UNNORMALIZED``), built on
-    the shared ``_make_unifrac_kernel`` pair kernel and ``_build_pair_index``
-    helper. Requires a GPU backend detected by ``detect_gpu_backend``.
-
+    Shared host-side body of the three ``*_unifrac_gpu`` drivers below: the
+    five methods differ only in the ``method``/``alpha`` the one kernel is
+    launched with, and in whether it reads node proportions or raw counts.
+    Requires a GPU backend detected by ``detect_gpu_backend``.
     """
     from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
 
@@ -356,127 +355,24 @@ def weighted_unifrac_gpu(
     tip_indices = _get_tip_indices(tree_index)
     sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
     n_samples = counts_by_node.shape[0]
-    proportions = np.divide(
-        counts_by_node,
-        sample_totals[:, None],
-        out=np.zeros_like(counts_by_node),
-        where=sample_totals[:, None] > 0,
-    )
+    if method in (UNWEIGHTED, UNWEIGHTED_UNNORMALIZED):
+        # The unweighted kernel branch only tests "proportions" for > 0
+        # (presence/absence), so raw counts can be passed directly in place of
+        # proportions, no division needed.
+        proportions = counts_by_node
+    else:
+        proportions = np.divide(
+            counts_by_node,
+            sample_totals[:, None],
+            out=np.zeros_like(counts_by_node),
+            where=sample_totals[:, None] > 0,
+        )
     n_pairs = n_samples * (n_samples - 1) // 2
     block_i, block_j = _build_block_pair_index(n_samples, tile)
 
-    d_proportions = cuda.to_device(proportions)
-    d_counts = cuda.to_device(counts_by_node)
-    d_sample_totals = cuda.to_device(sample_totals)
-    d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
-    d_block_i = cuda.to_device(block_i)
-    d_block_j = cuda.to_device(block_j)
-    d_out = cuda.device_array(n_pairs, dtype=np.float64)
-
-    method = WEIGHTED_NORMALIZED if normalized else WEIGHTED_UNNORMALIZED
-    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
-    kernel[block_i.shape[0], (tile, tile)](
-        d_proportions,
-        d_counts,
-        d_sample_totals,
-        d_branch_lengths,
-        method,
-        1.0,
-        variance_adjust,
-        d_block_i,
-        d_block_j,
-        n_samples,
-        d_out,
-    )
-    return d_out.copy_to_host()
-
-
-def unweighted_unifrac_gpu(
-    counts, taxa, tree, normalized, variance_adjust=False, validate=True
-):
-    """Compute the condensed unweighted UniFrac distance vector on a GPU.
-
-    Host-side driver for the unweighted UniFrac methods (``normalized``
-    selects between ``UNWEIGHTED`` and ``UNWEIGHTED_UNNORMALIZED``), built
-    on the shared ``_make_unifrac_kernel`` pair kernel and
-    ``_build_pair_index`` helper. Requires a GPU backend detected by
-    ``detect_gpu_backend``.
-
-    """
-    from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
-
-    cuda = get_cuda_module()
-    tile, node_chunk = _get_tile_config(detect_gpu_backend())
-    counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
-        counts, taxa, tree, validate
-    )
-    counts_by_node = np.ascontiguousarray(counts_by_node, dtype=np.float64)
-    tip_indices = _get_tip_indices(tree_index)
-    sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
-    n_samples = counts_by_node.shape[0]
-    # The unweighted kernel branch only tests "proportions" for > 0 (presence/
-    # absence), so raw counts can be passed directly in place of proportions,
-    # no division needed.
-    n_pairs = n_samples * (n_samples - 1) // 2
-    block_i, block_j = _build_block_pair_index(n_samples, tile)
-
-    d_proportions = cuda.to_device(counts_by_node)
-    d_counts = cuda.to_device(counts_by_node)
-    d_sample_totals = cuda.to_device(sample_totals)
-    d_branch_lengths = cuda.to_device(branch_lengths.astype(np.float64))
-    d_block_i = cuda.to_device(block_i)
-    d_block_j = cuda.to_device(block_j)
-    d_out = cuda.device_array(n_pairs, dtype=np.float64)
-
-    method = UNWEIGHTED if normalized else UNWEIGHTED_UNNORMALIZED
-    kernel = _make_unifrac_kernel(cuda, tile, node_chunk)
-    kernel[block_i.shape[0], (tile, tile)](
-        d_proportions,
-        d_counts,
-        d_sample_totals,
-        d_branch_lengths,
-        method,
-        1.0,
-        variance_adjust,
-        d_block_i,
-        d_block_j,
-        n_samples,
-        d_out,
-    )
-    return d_out.copy_to_host()
-
-
-def generalized_unifrac_gpu(
-    counts, taxa, tree, alpha, variance_adjust=False, validate=True
-):
-    """Compute the condensed generalized UniFrac distance vector on a GPU.
-
-    Host-side driver for the generalized UniFrac method (``GENERALIZED``),
-    built on the shared ``_make_unifrac_kernel`` pair kernel and
-    ``_build_pair_index`` helper. Requires a GPU backend detected by
-    ``detect_gpu_backend``.
-
-    """
-    from skbio.diversity.beta._unifrac import _setup_multiple_unifrac, _get_tip_indices
-
-    cuda = get_cuda_module()
-    tile, node_chunk = _get_tile_config(detect_gpu_backend())
-    counts_by_node, tree_index, branch_lengths = _setup_multiple_unifrac(
-        counts, taxa, tree, validate
-    )
-    counts_by_node = np.ascontiguousarray(counts_by_node, dtype=np.float64)
-    tip_indices = _get_tip_indices(tree_index)
-    sample_totals = counts_by_node[:, tip_indices].sum(axis=1)
-    n_samples = counts_by_node.shape[0]
-    proportions = np.divide(
-        counts_by_node,
-        sample_totals[:, None],
-        out=np.zeros_like(counts_by_node),
-        where=sample_totals[:, None] > 0,
-    )
-    n_pairs = n_samples * (n_samples - 1) // 2
-    block_i, block_j = _build_block_pair_index(n_samples, tile)
-
+    # Bound to locals, not inlined into the launch below: the kernel launch is
+    # asynchronous, so each device array must stay referenced until the
+    # copy_to_host() that synchronizes on it.
     d_proportions = cuda.to_device(proportions)
     d_counts = cuda.to_device(counts_by_node)
     d_sample_totals = cuda.to_device(sample_totals)
@@ -491,7 +387,7 @@ def generalized_unifrac_gpu(
         d_counts,
         d_sample_totals,
         d_branch_lengths,
-        GENERALIZED,
+        method,
         alpha,
         variance_adjust,
         d_block_i,
@@ -502,19 +398,78 @@ def generalized_unifrac_gpu(
     return d_out.copy_to_host()
 
 
+def weighted_unifrac_gpu(
+    counts, taxa, tree, normalized, variance_adjust=False, validate=True
+):
+    """Compute the condensed weighted UniFrac distance vector on a GPU.
+
+    Host-side driver for the weighted UniFrac methods (``normalized`` selects
+    between ``WEIGHTED_NORMALIZED`` and ``WEIGHTED_UNNORMALIZED``); see
+    ``_run_unifrac_kernel``.
+
+    """
+    return _run_unifrac_kernel(
+        counts,
+        taxa,
+        tree,
+        WEIGHTED_NORMALIZED if normalized else WEIGHTED_UNNORMALIZED,
+        variance_adjust=variance_adjust,
+        validate=validate,
+    )
+
+
+def unweighted_unifrac_gpu(
+    counts, taxa, tree, normalized, variance_adjust=False, validate=True
+):
+    """Compute the condensed unweighted UniFrac distance vector on a GPU.
+
+    Host-side driver for the unweighted UniFrac methods (``normalized``
+    selects between ``UNWEIGHTED`` and ``UNWEIGHTED_UNNORMALIZED``); see
+    ``_run_unifrac_kernel``.
+
+    """
+    return _run_unifrac_kernel(
+        counts,
+        taxa,
+        tree,
+        UNWEIGHTED if normalized else UNWEIGHTED_UNNORMALIZED,
+        variance_adjust=variance_adjust,
+        validate=validate,
+    )
+
+
+def generalized_unifrac_gpu(
+    counts, taxa, tree, alpha, variance_adjust=False, validate=True
+):
+    """Compute the condensed generalized UniFrac distance vector on a GPU.
+
+    Host-side driver for the generalized UniFrac method (``GENERALIZED``);
+    see ``_run_unifrac_kernel``.
+
+    """
+    return _run_unifrac_kernel(
+        counts,
+        taxa,
+        tree,
+        GENERALIZED,
+        alpha=alpha,
+        variance_adjust=variance_adjust,
+        validate=validate,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Two-tier dispatch: fused GPU kernel when usable, array-API fallback otherwise
 # -----------------------------------------------------------------------------
 #
 # The three driver functions above require a real, detected GPU backend
-# (``get_cuda_module`` raises ``ImportError`` otherwise) and are left exactly
-# as-is: they already run correctly on real NVIDIA/AMD hardware, including
-# proactively moving plain NumPy input onto the device for the fused-kernel
-# speedup. The wrappers below add the fallback: when no GPU backend is
-# detected, or when the fused kernel fails to build/run on the running stack,
-# they run the array-API-generic implementation in
-# :mod:`skbio.diversity.beta._unifrac_xp` instead, which is correct (if
-# slower) on any array-API backend, including plain NumPy on CPU.
+# (``get_cuda_module`` raises ``ImportError`` otherwise): they already run
+# correctly on real NVIDIA/AMD hardware, including proactively moving plain
+# NumPy input onto the device for the fused-kernel speedup. The wrappers below
+# add the fallback: when no GPU backend is detected, or when the fused kernel
+# fails to build/run on the running stack, they run the array-API-generic
+# implementation in :mod:`skbio.diversity.beta._unifrac_xp` instead, which is
+# correct (if slower) on any array-API backend, including plain NumPy on CPU.
 
 # Backends ('cuda'/'hip') whose fused kernel failed to build or run in this
 # process. Populated by `_mark_backend_unavailable` so later calls skip
@@ -545,12 +500,20 @@ def _mark_backend_unavailable(backend):
         )
 
 
-def _usable_gpu_backend():
-    """Return `detect_gpu_backend()`'s result, unless its kernel already failed."""
+def _dispatch_gpu_or_xp(gpu_func, xp_func, *args, **kwargs):
+    """Call ``gpu_func`` if the fused kernel is usable, else ``xp_func``.
+
+    Any exception out of the fused kernel marks its backend unavailable for
+    the rest of the process and falls through to the array-API path, so one
+    bad kernel build degrades performance rather than failing the call.
+    """
     backend = detect_gpu_backend()
-    if backend in _unavailable_backends:
-        return None
-    return backend
+    if backend is not None and backend not in _unavailable_backends:
+        try:
+            return gpu_func(*args, **kwargs)
+        except Exception:
+            _mark_backend_unavailable(backend)
+    return xp_func(*args, **kwargs)
 
 
 def weighted_unifrac_gpu_or_xp(
@@ -564,20 +527,17 @@ def weighted_unifrac_gpu_or_xp(
     correct (if slower) on any array-API backend, including plain NumPy.
 
     """
-    backend = _usable_gpu_backend()
-    if backend is not None:
-        try:
-            return weighted_unifrac_gpu(
-                counts, taxa, tree, normalized,
-                variance_adjust=variance_adjust, validate=validate,
-            )
-        except Exception:
-            _mark_backend_unavailable(backend)
     from skbio.diversity.beta._unifrac_xp import weighted_unifrac_xp
 
-    return weighted_unifrac_xp(
-        counts, taxa, tree, normalized,
-        variance_adjust=variance_adjust, validate=validate,
+    return _dispatch_gpu_or_xp(
+        weighted_unifrac_gpu,
+        weighted_unifrac_xp,
+        counts,
+        taxa,
+        tree,
+        normalized,
+        variance_adjust=variance_adjust,
+        validate=validate,
     )
 
 
@@ -590,20 +550,17 @@ def unweighted_unifrac_gpu_or_xp(
     :func:`skbio.diversity.beta._unifrac_xp.unweighted_unifrac_xp`.
 
     """
-    backend = _usable_gpu_backend()
-    if backend is not None:
-        try:
-            return unweighted_unifrac_gpu(
-                counts, taxa, tree, normalized,
-                variance_adjust=variance_adjust, validate=validate,
-            )
-        except Exception:
-            _mark_backend_unavailable(backend)
     from skbio.diversity.beta._unifrac_xp import unweighted_unifrac_xp
 
-    return unweighted_unifrac_xp(
-        counts, taxa, tree, normalized,
-        variance_adjust=variance_adjust, validate=validate,
+    return _dispatch_gpu_or_xp(
+        unweighted_unifrac_gpu,
+        unweighted_unifrac_xp,
+        counts,
+        taxa,
+        tree,
+        normalized,
+        variance_adjust=variance_adjust,
+        validate=validate,
     )
 
 
@@ -616,18 +573,15 @@ def generalized_unifrac_gpu_or_xp(
     :func:`skbio.diversity.beta._unifrac_xp.generalized_unifrac_xp`.
 
     """
-    backend = _usable_gpu_backend()
-    if backend is not None:
-        try:
-            return generalized_unifrac_gpu(
-                counts, taxa, tree, alpha,
-                variance_adjust=variance_adjust, validate=validate,
-            )
-        except Exception:
-            _mark_backend_unavailable(backend)
     from skbio.diversity.beta._unifrac_xp import generalized_unifrac_xp
 
-    return generalized_unifrac_xp(
-        counts, taxa, tree, alpha,
-        variance_adjust=variance_adjust, validate=validate,
+    return _dispatch_gpu_or_xp(
+        generalized_unifrac_gpu,
+        generalized_unifrac_xp,
+        counts,
+        taxa,
+        tree,
+        alpha,
+        variance_adjust=variance_adjust,
+        validate=validate,
     )
