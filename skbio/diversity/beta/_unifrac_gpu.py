@@ -240,9 +240,9 @@ def _make_unifrac_kernel(cuda, tile, node_chunk):
             # [ty, col], a warp-uniform access (every lane in a
             # warp/wavefront reads the same address), which has no bank
             # conflict to fix, so they are left unpadded.
-            sh_prop_i = cuda.shared.array((TILE, NODE_CHUNK_PADDED), dtype=float64)
+            sh_prop_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
             sh_prop_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
-            sh_cnt_i = cuda.shared.array((TILE, NODE_CHUNK_PADDED), dtype=float64)
+            sh_cnt_i = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
             sh_cnt_j = cuda.shared.array((TILE, NODE_CHUNK), dtype=float64)
             sh_branch = cuda.shared.array(NODE_CHUNK, dtype=float64)
 
