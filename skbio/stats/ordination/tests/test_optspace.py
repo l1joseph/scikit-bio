@@ -644,6 +644,25 @@ class TestJacobianNumba(unittest.TestCase):
         np.testing.assert_allclose(observed_dV, expected_dV, atol=1e-10)
 
     @numba_code
+    def test_jacobian_UV_nb_preserves_dtype(self):
+        """The Numba kernels follow the input dtype, like the NumPy path does."""
+        US32 = self.US.astype(np.float32)
+        VST32 = self.VST.astype(np.float32)
+        dU_t = self.rng.normal(size=(self.m, self.r)).astype(np.float32)
+        dV_t = self.rng.normal(size=(self.n, self.r)).astype(np.float32)
+
+        w = optspace_mod._jacobian_UV_nb(
+            dU_t, dV_t, self.rows, self.cols, US32, VST32
+        )
+        self.assertEqual(w.dtype, np.float32)
+
+        dU, dV = optspace_mod._jacobian_UV_adj_nb(
+            w, self.rows, self.cols, US32, VST32, self.m, self.n
+        )
+        self.assertEqual(dU.dtype, np.float32)
+        self.assertEqual(dV.dtype, np.float32)
+
+    @numba_code
     def test_jacobian_UV_adjoint_identity_nb(self):
         """The Numba pair is an exact adjoint pair, as LSMR requires."""
         dU = self.rng.normal(size=(self.m, self.r))

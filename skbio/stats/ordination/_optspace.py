@@ -88,7 +88,7 @@ if NUMBA_AVAILABLE:
         """
         n_observed = rows.shape[0]
         r = US.shape[1]
-        w = np.empty(n_observed, np.float64)
+        w = np.empty(n_observed, US.dtype)
 
         for k in prange(n_observed):
             i = rows[k]
@@ -147,8 +147,8 @@ if NUMBA_AVAILABLE:
         """
         n_observed = rows.shape[0]
         r = US.shape[1]
-        dU = np.zeros((m, r), np.float64)
-        dV = np.zeros((n, r), np.float64)
+        dU = np.zeros((m, r), US.dtype)
+        dV = np.zeros((n, r), US.dtype)
 
         for k in range(n_observed):
             i = rows[k]
